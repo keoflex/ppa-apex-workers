@@ -1,0 +1,45 @@
+# PPA+ APEX — Cloudflare Workers Configuration
+# Strike Engine: Queue consumer + Durable Object for HITL state
+
+name = "ppa-apex-workers"
+main = "src/index.ts"
+compatibility_date = "2025-02-24"
+account_id = "78ea385b814960bac401db0341907944"
+
+# ── Environment Variables ──
+[vars]
+ENVIRONMENT = "development"
+
+# Secrets (set via `wrangler secret put`):
+# SUPABASE_URL
+# SUPABASE_SERVICE_ROLE_KEY
+# GEMINI_API_KEY
+# EXA_API_KEY
+# APOLLO_API_KEY
+# SMARTLEAD_API_KEY
+# WORKER_SECRET
+
+# ── Durable Objects ──
+[durable_objects]
+bindings = [
+  { name = "HITL_GATE", class_name = "HitlGateDurableObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HitlGateDurableObject"]
+
+# ── Queues ──
+[[queues.producers]]
+queue = "strike-pipeline"
+binding = "STRIKE_QUEUE"
+
+[[queues.consumers]]
+queue = "strike-pipeline"
+max_batch_size = 10
+max_batch_timeout = 30
+
+# ── Cron Triggers ──
+# 9 AM EST (14:00 UTC) Mon-Fri — market sensing
+[triggers]
+crons = ["0 14 * * 1-5"]
