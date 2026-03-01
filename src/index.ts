@@ -322,7 +322,7 @@ export default {
 
                 console.log(`🧠 AI Resync requested for ${body.companyName}`);
 
-                const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent';
+                const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
                 const systemPrompt = `You are a strategic business intelligence analyst. Research and generate a concise but comprehensive profile of the specified company.
 
@@ -347,14 +347,14 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     body: JSON.stringify({
                         system_instruction: { parts: [{ text: systemPrompt }] },
                         contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-                        generationConfig: { temperature: 0.7, maxOutputTokens: 512, responseMimeType: 'application/json' },
+                        generationConfig: { temperature: 0.7, maxOutputTokens: 1024, responseMimeType: 'application/json' },
                     }),
                 });
 
                 if (!geminiRes.ok) {
                     const errText = await geminiRes.text();
                     console.error(`[ai-resync] Gemini error ${geminiRes.status}: ${errText}`);
-                    return jsonWithCors({ error: `Gemini API error ${geminiRes.status}` }, { status: 502 });
+                    return jsonWithCors({ error: `Gemini API error ${geminiRes.status}: ${errText.slice(0, 200)}` }, { status: 502 });
                 }
 
                 const geminiData = await geminiRes.json() as any;
@@ -362,10 +362,23 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                 const rawText = parts.find((p: any) => p.text)?.text;
 
                 if (!rawText) {
+                    console.error('[ai-resync] Gemini empty response:', JSON.stringify(geminiData).slice(0, 300));
                     return jsonWithCors({ error: 'Gemini returned empty response' }, { status: 502 });
                 }
 
-                const parsed = JSON.parse(rawText);
+                let parsed: any;
+                try {
+                    parsed = JSON.parse(rawText);
+                } catch {
+                    console.error('[ai-resync] Failed to parse Gemini output:', rawText.slice(0, 300));
+                    // Try to extract from markdown code block
+                    const jsonMatch = rawText.match(/```json?\s*([\s\S]*?)```/);
+                    if (jsonMatch) {
+                        parsed = JSON.parse(jsonMatch[1].trim());
+                    } else {
+                        return jsonWithCors({ summary: rawText.slice(0, 500), industry: null, revenue: null, headcount: null });
+                    }
+                }
                 console.log(`✅ AI Resync complete for ${body.companyName}`);
 
                 return jsonWithCors({
