@@ -182,18 +182,36 @@ Write the outreach email. Sound human. Reference specific deal details. Be brief
             }>;
         };
 
-        // Gemini 3 may return multiple parts (text + thoughtSignature). Find the text part.
+        // Gemini 3 returns thought parts (reasoning) alongside the actual text.
+        // Filter out thought parts and find the real JSON output.
         const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-        const rawText = parts.find((p: any) => p.text)?.text;
+
+        // First: try non-thought parts (the actual model output)
+        const nonThoughtParts = parts.filter((p: any) => p.text && !p.thought);
+        let rawText = nonThoughtParts.length > 0
+            ? nonThoughtParts[nonThoughtParts.length - 1].text  // Take LAST non-thought part
+            : null;
+
+        // Fallback: if no non-thought parts, try any part with text
+        if (!rawText) {
+            rawText = parts.filter((p: any) => p.text).pop()?.text;
+        }
+
         if (!rawText) {
             throw new Error('Gemini returned an empty response');
         }
 
+        // Clean the text: strip markdown code fences if Gemini wraps JSON in ```json...```
+        let cleanedText = rawText.trim();
+        if (cleanedText.startsWith('```')) {
+            cleanedText = cleanedText.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+        }
+
         // Parse the JSON payload from the model
-        const parsed = JSON.parse(rawText) as { subject?: string; body?: string };
+        const parsed = JSON.parse(cleanedText) as { subject?: string; body?: string };
 
         if (!parsed.subject || !parsed.body) {
-            throw new Error('Gemini response missing subject or body fields');
+            throw new Error(`Gemini response missing subject or body fields. Got: ${cleanedText.slice(0, 200)}`);
         }
 
         const draft: StrikeDraft = {
