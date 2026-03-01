@@ -460,7 +460,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
         if (protectedPaths.includes(url.pathname) && request.method === 'POST') {
             const secret = request.headers.get('x-worker-secret');
             if (!secret || secret !== env.WORKER_SECRET) {
-                return Response.json(
+                return jsonWithCors(
                     { error: 'Unauthorized — invalid or missing x-worker-secret header' },
                     { status: 401 },
                 );
