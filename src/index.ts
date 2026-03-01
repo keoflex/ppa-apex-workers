@@ -213,6 +213,79 @@ export default {
             }
         }
 
+        // Enrich a CRM contact via Apollo people/match (find email, phone, LinkedIn)
+        if (url.pathname === '/api/enrich-contact' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    firstName: string;
+                    lastName: string;
+                    organizationName: string;
+                    domain?: string;
+                    title?: string;
+                };
+
+                console.log(`🔍 Contact enrich requested for ${body.firstName} ${body.lastName} at ${body.organizationName}`);
+
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000);
+
+                const res = await fetch('https://api.apollo.io/v1/people/match', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': env.APOLLO_API_KEY || '',
+                    },
+                    body: JSON.stringify({
+                        first_name: body.firstName,
+                        last_name: body.lastName,
+                        organization_name: body.organizationName,
+                        ...(body.domain ? { domain: body.domain } : {}),
+                        ...(body.title ? { title: body.title } : {}),
+                    }),
+                    signal: controller.signal,
+                });
+
+                clearTimeout(timeout);
+
+                if (!res.ok) {
+                    const errBody = await res.text().catch(() => '');
+                    console.error(`[enrich-contact] Apollo returned ${res.status}: ${errBody}`);
+                    return jsonWithCors({ error: `Apollo returned ${res.status}`, detail: errBody }, { status: 502 });
+                }
+
+                const data = await res.json() as any;
+                const person = data.person;
+
+                if (!person) {
+                    return jsonWithCors({ status: 'not_found', message: 'No match found in Apollo' });
+                }
+
+                const phones = (person.phone_numbers || []).map((p: any) => ({
+                    number: p.sanitized_number || p.raw_number || '',
+                    type: p.type || 'unknown',
+                })).filter((p: any) => p.number);
+
+                return jsonWithCors({
+                    status: 'found',
+                    email: person.email || null,
+                    phone: phones[0]?.number || null,
+                    linkedin_url: person.linkedin_url || null,
+                    title: person.title || null,
+                    headline: person.headline || null,
+                    city: person.city || null,
+                    state: person.state || null,
+                    seniority: person.seniority || null,
+                    departments: person.departments || [],
+                });
+            } catch (error: any) {
+                if (error?.name === 'AbortError') {
+                    return jsonWithCors({ error: 'Apollo enrich timed out (10s)' }, { status: 504 });
+                }
+                console.error('[enrich-contact] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // Phone webhook receiver — Apollo pushes phone data here
         if (url.pathname === '/api/phone-webhook' && request.method === 'POST') {
             try {
