@@ -751,6 +751,106 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     leadId: body.leadId,
                 });
 
+                // ── Exa Company Intelligence Search ──
+                let companyIntel: any = null;
+                if (env.EXA_API_KEY) {
+                    try {
+                        console.log(`🕵️ Exa company intelligence search for ${body.company}...`);
+
+                        // Search for company website, news, press releases
+                        const exaRes = await fetch('https://api.exa.ai/search', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'x-api-key': env.EXA_API_KEY,
+                            },
+                            body: JSON.stringify({
+                                query: `${body.company} company official website about`,
+                                numResults: 5,
+                                useAutoprompt: true,
+                                contents: {
+                                    text: { maxCharacters: 2000 },
+                                    highlights: { numSentences: 3, highlightsPerUrl: 2 },
+                                },
+                            }),
+                        });
+
+                        if (exaRes.ok) {
+                            const exaData = await exaRes.json() as any;
+                            const results = exaData.results || [];
+
+                            // Extract key info from results
+                            const sources = results.map((r: any) => ({
+                                title: r.title || '',
+                                url: r.url || '',
+                                text: (r.text || '').slice(0, 500),
+                                highlights: r.highlights || [],
+                            }));
+
+                            // Find company website (first result that looks like company domain)
+                            const companyDomain = result.companyDomain || '';
+                            const websiteResult = sources.find((s: any) =>
+                                s.url.includes(companyDomain) ||
+                                s.url.includes(body.company.toLowerCase().replace(/[^a-z0-9]/g, ''))
+                            );
+
+                            // Combine all text for Gemini summarization
+                            const allText = sources.map((s: any) => `Source: ${s.url}\n${s.text}`).join('\n\n');
+
+                            // Summarize with Gemini
+                            if (allText && env.GEMINI_API_KEY) {
+                                const { GEMINI_REST_URL } = await import('./config/gemini');
+                                const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        contents: [{
+                                            role: 'user', parts: [{
+                                                text: `Based on the following web search results about "${body.company}", provide a concise company intelligence summary in JSON format:
+
+${allText}
+
+Return ONLY a JSON object:
+{
+  "website": "company's official website URL",
+  "description": "2-3 sentence description of what the company does",
+  "keyFacts": ["fact 1", "fact 2", "fact 3"],
+  "recentNews": ["news item 1", "news item 2"],
+  "industry": "primary industry",
+  "headquarters": "city, state if known"
+}` }]
+                                        }],
+                                        generationConfig: { temperature: 0.2, maxOutputTokens: 1024, responseMimeType: 'application/json' },
+                                    }),
+                                });
+
+                                if (geminiRes.ok) {
+                                    const geminiData = await geminiRes.json() as any;
+                                    const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+                                    const nonThought = parts.filter((p: any) => p.text && !p.thought);
+                                    const rawText = nonThought.length > 0 ? nonThought[nonThought.length - 1].text : parts.find((p: any) => p.text)?.text;
+                                    if (rawText) {
+                                        try {
+                                            companyIntel = JSON.parse(rawText.trim());
+                                            console.log(`✅ Company intel summarized: ${companyIntel.description?.slice(0, 60)}...`);
+                                        } catch {
+                                            console.warn('⚠️ Failed to parse Gemini company intel JSON');
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Add source links
+                            if (companyIntel) {
+                                companyIntel.sources = sources.map((s: any) => ({ title: s.title, url: s.url }));
+                                companyIntel.website = companyIntel.website || websiteResult?.url || '';
+                            }
+                        }
+                    } catch (err) {
+                        console.warn('⚠️ Exa company research failed:', err);
+                    }
+                }
+
                 return jsonWithCors({
                     status: 'completed',
                     email: result.email || null,
@@ -761,6 +861,9 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     companyDomain: result.companyDomain || null,
                     companyRevenue: result.companyRevenue || null,
                     employeeCount: result.employeeCount || null,
+                    executiveName: result.executiveName || null,
+                    executiveTitle: result.executiveTitle || null,
+                    executiveResearch: result.executiveResearch || null,
                     patternEmails: result.patternEmails || [],
                     otherContacts: (result.otherContacts || []).map((c: any) => ({
                         name: c.name,
@@ -770,6 +873,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         linkedinUrl: c.linkedinUrl || c.linkedin_url,
                         seniority: c.seniority,
                     })),
+                    companyIntel: companyIntel || null,
                 });
             } catch (error) {
                 console.error('[re-enrich] Error:', error);
