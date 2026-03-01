@@ -439,6 +439,124 @@ function generateEmailPatterns(name: string, domain: string): string[] {
     ];
 }
 
+// ─── Step 5b: Gemini AI Contact Discovery (fallback) ──────────────────
+interface GeminiContactResult {
+    email?: string;
+    emailConfidence?: string;
+    phone?: string;
+    phoneConfidence?: string;
+    linkedinUrl?: string;
+    twitterUrl?: string;
+    companyDomain?: string;
+    reasoning?: string;
+}
+
+async function geminiContactDiscovery(
+    env: Env,
+    name: string,
+    company: string,
+    title: string,
+    companyDomain?: string,
+): Promise<GeminiContactResult | null> {
+    if (!env.GEMINI_API_KEY || name === 'Unknown') return null;
+
+    console.log(`🤖 Layer 5b: Gemini contact discovery for ${name} at ${company}...`);
+
+    try {
+        const prompt = `You are a business intelligence researcher. Find ALL available contact information for:
+
+Name: ${name}
+Title: ${title}
+Company: ${company}
+${companyDomain ? `Known Company Domain: ${companyDomain}` : ''}
+
+Search your knowledge for:
+1. **Email**: Their professional email address. If you know it, provide it. If not, determine the company's email format and construct the most likely email.
+2. **Phone**: Their direct phone number, office number, or mobile if publicly known.
+3. **LinkedIn**: Their LinkedIn profile URL (format: linkedin.com/in/slug).
+4. **Twitter/X**: Their Twitter handle or URL.
+5. **Company Domain**: The company's primary website domain.
+
+For each piece of information, rate confidence:
+- HIGH: You have directly seen this information referenced in reliable sources
+- MEDIUM: Strong inference from known patterns (e.g., company email format)
+- LOW: Educated guess
+
+Reply with ONLY a JSON object:
+{
+  "email": "email@domain.com or empty string",
+  "emailConfidence": "HIGH|MEDIUM|LOW|NONE",
+  "phone": "phone number or empty string",
+  "phoneConfidence": "HIGH|MEDIUM|LOW|NONE",
+  "linkedinUrl": "full linkedin URL or empty string",
+  "twitterUrl": "full twitter/X URL or empty string",
+  "companyDomain": "company.com",
+  "reasoning": "brief explanation of sources/method"
+}`;
+
+        const res = await fetchWithTimeout(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.1, maxOutputTokens: 400 },
+            }),
+        });
+
+        if (!res.ok) return null;
+
+        const data = await res.json() as any;
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if (!text) return null;
+
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) return null;
+
+        const parsed = JSON.parse(jsonMatch[0]);
+
+        // Map Gemini confidence to our system (AI is always lower than verified data)
+        const mapConfidence = (level: string) => {
+            if (level === 'HIGH') return 'medium';   // Gemini "high" → our "medium"
+            if (level === 'MEDIUM') return 'low';
+            return 'low';
+        };
+
+        const result: GeminiContactResult = { reasoning: parsed.reasoning };
+
+        if (parsed.email && parsed.email.includes('@') && parsed.emailConfidence !== 'NONE') {
+            result.email = parsed.email.toLowerCase();
+            result.emailConfidence = mapConfidence(parsed.emailConfidence);
+        }
+        if (parsed.phone && parsed.phoneConfidence !== 'NONE') {
+            result.phone = parsed.phone;
+            result.phoneConfidence = mapConfidence(parsed.phoneConfidence);
+        }
+        if (parsed.linkedinUrl && parsed.linkedinUrl.includes('linkedin.com')) {
+            result.linkedinUrl = parsed.linkedinUrl;
+        }
+        if (parsed.twitterUrl) {
+            result.twitterUrl = parsed.twitterUrl;
+        }
+        if (parsed.companyDomain) {
+            result.companyDomain = parsed.companyDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+        }
+
+        const found = [
+            result.email ? `Email: ${result.email}` : null,
+            result.phone ? `Phone: ${result.phone}` : null,
+            result.linkedinUrl ? 'LinkedIn' : null,
+        ].filter(Boolean);
+
+        console.log(`🤖 Gemini found: ${found.length > 0 ? found.join(', ') : 'nothing new'} — ${parsed.reasoning || ''}`);
+
+        return found.length > 0 || result.companyDomain ? result : null;
+    } catch (err) {
+        console.warn('⚠️ Gemini contact discovery failed:', err);
+    }
+
+    return null;
+}
+
 // ─── Step 6: Exa Deep Research ────────────────────────────────────────
 async function exaDeepResearch(
     env: Env,
@@ -609,11 +727,41 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
             const patterns = generateEmailPatterns(lead.executiveName, lead.companyDomain);
             if (patterns.length > 0) {
                 lead.patternEmails = patterns;
-                lead.email = patterns[0]; // best guess: first.last@domain
-                lead.emailSource = 'pattern_guess';
-                lead.emailConfidence = 'low';
-                console.log(`📧 Layer 5: Generated ${patterns.length} email patterns, best guess: ${patterns[0]}`);
+                // Don't set as primary email yet — let Gemini try first
+                console.log(`📧 Layer 5: Generated ${patterns.length} email patterns`);
             }
+        }
+
+        // STEP 5b: Gemini AI Contact Discovery (fills in any missing data)
+        if (!emailFound || !lead.phone || !lead.linkedinUrl) {
+            const geminiResult = await geminiContactDiscovery(
+                env, lead.executiveName, lead.company, lead.executiveTitle, lead.companyDomain
+            );
+            if (geminiResult) {
+                if (geminiResult.email && !emailFound) {
+                    lead.email = geminiResult.email;
+                    lead.emailSource = 'gemini_inference';
+                    lead.emailConfidence = geminiResult.emailConfidence || 'low';
+                    emailFound = true;
+                }
+                if (geminiResult.phone && !lead.phone) {
+                    lead.phone = geminiResult.phone;
+                }
+                if (geminiResult.linkedinUrl && !lead.linkedinUrl) {
+                    lead.linkedinUrl = geminiResult.linkedinUrl;
+                }
+                if (geminiResult.companyDomain && !lead.companyDomain) {
+                    lead.companyDomain = geminiResult.companyDomain;
+                }
+            }
+        }
+
+        // If still no email, fall back to pattern guess
+        if (!emailFound && lead.patternEmails?.length) {
+            lead.email = lead.patternEmails[0];
+            lead.emailSource = 'pattern_guess';
+            lead.emailConfidence = 'low';
+            console.log(`📧 Using pattern email as last resort: ${lead.patternEmails[0]}`);
         }
 
         // Extract org data

@@ -147,6 +147,12 @@ export default {
 
                 console.log(`📞 Phone reveal requested for ${body.firstName} ${body.lastName} at ${body.organizationName}`);
 
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000);
+
+                // Apollo requires a webhook_url for phone reveals — it processes async
+                const webhookUrl = `https://ppa-apex-workers.fred-78e.workers.dev/api/phone-webhook`;
+
                 const res = await fetch('https://api.apollo.io/v1/people/match', {
                     method: 'POST',
                     headers: {
@@ -159,36 +165,109 @@ export default {
                         organization_name: body.organizationName,
                         ...(body.email ? { email: body.email } : {}),
                         reveal_phone_number: true,
+                        webhook_url: webhookUrl,
                     }),
+                    signal: controller.signal,
                 });
 
+                clearTimeout(timeout);
+
                 if (!res.ok) {
-                    return jsonWithCors({ error: `Apollo returned ${res.status}` }, { status: 502 });
+                    const errBody = await res.text().catch(() => '');
+                    console.error(`[reveal-phone] Apollo returned ${res.status}: ${errBody}`);
+                    return jsonWithCors({ error: `Apollo returned ${res.status}`, detail: errBody }, { status: 502 });
                 }
 
                 const data = await res.json() as any;
                 const person = data.person;
 
-                if (!person) {
-                    return jsonWithCors({ error: 'No person found' }, { status: 404 });
-                }
-
-                // Extract all phone numbers
-                const phones = (person.phone_numbers || []).map((p: any) => ({
+                // Check if phone numbers came back immediately (sometimes they do)
+                const phones = (person?.phone_numbers || []).map((p: any) => ({
                     number: p.sanitized_number || p.raw_number || '',
-                    type: p.type || 'unknown', // mobile, work_hq, work_direct, etc.
+                    type: p.type || 'unknown',
                 })).filter((p: any) => p.number);
 
-                console.log(`📞 Found ${phones.length} phone numbers for ${body.firstName} ${body.lastName}`);
+                if (phones.length > 0) {
+                    console.log(`📞 Found ${phones.length} phone numbers immediately`);
+                    return jsonWithCors({
+                        status: 'revealed',
+                        phones,
+                        primaryPhone: phones[0]?.number || null,
+                        primaryPhoneType: phones[0]?.type || null,
+                    });
+                }
 
+                // Phone reveal is processing async — Apollo will push to webhook
+                console.log(`📞 Phone reveal submitted — Apollo will push via webhook`);
                 return jsonWithCors({
-                    status: 'revealed',
-                    phones,
-                    primaryPhone: phones[0]?.number || null,
-                    primaryPhoneType: phones[0]?.type || null,
+                    status: 'processing',
+                    message: 'Phone reveal submitted. Apollo is processing — the phone number will appear shortly after refreshing.',
+                    primaryPhone: null,
                 });
-            } catch (error) {
+            } catch (error: any) {
+                if (error?.name === 'AbortError') {
+                    return jsonWithCors({ error: 'Apollo phone reveal timed out (10s)' }, { status: 504 });
+                }
                 console.error('[reveal-phone] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // Phone webhook receiver — Apollo pushes phone data here
+        if (url.pathname === '/api/phone-webhook' && request.method === 'POST') {
+            try {
+                const body = await request.json() as any;
+                console.log(`📞 Phone webhook received:`, JSON.stringify(body).slice(0, 500));
+
+                // Apollo sends the person data with phone numbers
+                const person = body.person || body;
+                const phones = (person.phone_numbers || []).map((p: any) => ({
+                    number: p.sanitized_number || p.raw_number || '',
+                    type: p.type || 'unknown',
+                })).filter((p: any) => p.number);
+
+                if (phones.length > 0 && person.email) {
+                    // Find the lead_target by email and update enrichment_data
+                    const supabaseUrl = env.SUPABASE_URL;
+                    const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY;
+                    if (supabaseUrl && supabaseKey) {
+                        // Search for the lead target with this email
+                        const searchRes = await fetch(
+                            `${supabaseUrl}/rest/v1/lead_targets?enrichment_data->>email=eq.${encodeURIComponent(person.email)}&select=id,enrichment_data`,
+                            {
+                                headers: {
+                                    'apikey': supabaseKey,
+                                    'Authorization': `Bearer ${supabaseKey}`,
+                                },
+                            }
+                        );
+                        if (searchRes.ok) {
+                            const targets = await searchRes.json() as any[];
+                            for (const target of targets) {
+                                const existing = target.enrichment_data || {};
+                                existing.phone = phones[0].number;
+                                await fetch(
+                                    `${supabaseUrl}/rest/v1/lead_targets?id=eq.${target.id}`,
+                                    {
+                                        method: 'PATCH',
+                                        headers: {
+                                            'apikey': supabaseKey,
+                                            'Authorization': `Bearer ${supabaseKey}`,
+                                            'Content-Type': 'application/json',
+                                            'Prefer': 'return=minimal',
+                                        },
+                                        body: JSON.stringify({ enrichment_data: existing }),
+                                    }
+                                );
+                                console.log(`📞 Phone saved to lead_target ${target.id}: ${phones[0].number}`);
+                            }
+                        }
+                    }
+                }
+
+                return jsonWithCors({ status: 'received', phones: phones.length });
+            } catch (error) {
+                console.error('[phone-webhook] Error:', error);
                 return jsonWithCors({ error: String(error) }, { status: 500 });
             }
         }
