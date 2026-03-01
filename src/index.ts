@@ -14,6 +14,7 @@ import { generateDraft } from './activities/generate-draft';
 import { geminiUrl, GEMINI_REST_URL } from './config/gemini';
 import { executeCampaign } from './activities/execute-campaign';
 import { triageReply } from './activities/triage-reply';
+import { copilotChat, type CopilotRequest } from './activities/copilot-chat';
 import { insertRow, patchRow, fetchRow } from './utils/supabase';
 
 export { HitlGateDurableObject };
@@ -455,7 +456,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
         }
 
         // ── Shared-secret guard for protected routes ──
-        const protectedPaths = ['/api/execute'];
+        const protectedPaths = ['/api/execute', '/api/copilot/chat'];
         if (protectedPaths.includes(url.pathname) && request.method === 'POST') {
             const secret = request.headers.get('x-worker-secret');
             if (!secret || secret !== env.WORKER_SECRET) {
@@ -463,6 +464,22 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     { error: 'Unauthorized — invalid or missing x-worker-secret header' },
                     { status: 401 },
                 );
+            }
+        }
+
+        // ── APEX Copilot Chat ──
+        if (url.pathname === '/api/copilot/chat' && request.method === 'POST') {
+            try {
+                const body = await request.json() as CopilotRequest;
+                if (!body.message) {
+                    return jsonWithCors({ error: 'Missing "message" field' }, { status: 400 });
+                }
+                console.log(`🤖 Copilot: "${body.message.slice(0, 80)}"`);
+                const result = await copilotChat(body, env);
+                return jsonWithCors(result);
+            } catch (error: any) {
+                console.error('[copilot] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
             }
         }
 
@@ -848,9 +865,20 @@ Generate a strategic intelligence profile for this company. Be factual, specific
      * Queue handler — processes strike pipeline messages asynchronously.
      * This prevents HTTP request timeouts when AI APIs take 15+ seconds.
      */
-    async queue(batch: MessageBatch<{ campaignId: number; persona: string; workflowId?: string; action?: 'regenerate' | 'research' | 'dispatch_agent'; source?: string; agentId?: number }>, env: Env): Promise<void> {
+    async queue(batch: MessageBatch<any>, env: Env): Promise<void> {
         for (const msg of batch.messages) {
             try {
+                // ── Handle custom_strike from Copilot ──
+                if (msg.body?.type === 'custom_strike') {
+                    const { target_company, context } = msg.body;
+                    console.log(`🎯 Custom strike dispatched for: ${target_company}`);
+                    // For now, log and acknowledge — full pipeline integration is a future phase
+                    console.log(`   Context: ${context || 'none'}`);
+                    console.log(`   → Ad-hoc pipeline would run: Exa sense → Apollo enrich → Gemini draft`);
+                    msg.ack();
+                    continue;
+                }
+
                 const { campaignId, persona, workflowId: regenerateWorkflowId, action } = msg.body;
                 console.log(`📨 Queue processing: Campaign #${campaignId} | Persona: ${persona} | Action: ${action || 'new'}`);
 
