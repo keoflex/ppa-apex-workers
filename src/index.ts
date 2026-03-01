@@ -135,6 +135,64 @@ export default {
             }
         }
 
+        // Reveal phone number on-demand (costs 8 mobile credits per reveal)
+        if (url.pathname === '/api/reveal-phone' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    firstName: string;
+                    lastName: string;
+                    organizationName: string;
+                    email?: string;
+                };
+
+                console.log(`📞 Phone reveal requested for ${body.firstName} ${body.lastName} at ${body.organizationName}`);
+
+                const res = await fetch('https://api.apollo.io/v1/people/match', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': env.APOLLO_API_KEY || '',
+                    },
+                    body: JSON.stringify({
+                        first_name: body.firstName,
+                        last_name: body.lastName,
+                        organization_name: body.organizationName,
+                        ...(body.email ? { email: body.email } : {}),
+                        reveal_phone_number: true,
+                    }),
+                });
+
+                if (!res.ok) {
+                    return jsonWithCors({ error: `Apollo returned ${res.status}` }, { status: 502 });
+                }
+
+                const data = await res.json() as any;
+                const person = data.person;
+
+                if (!person) {
+                    return jsonWithCors({ error: 'No person found' }, { status: 404 });
+                }
+
+                // Extract all phone numbers
+                const phones = (person.phone_numbers || []).map((p: any) => ({
+                    number: p.sanitized_number || p.raw_number || '',
+                    type: p.type || 'unknown', // mobile, work_hq, work_direct, etc.
+                })).filter((p: any) => p.number);
+
+                console.log(`📞 Found ${phones.length} phone numbers for ${body.firstName} ${body.lastName}`);
+
+                return jsonWithCors({
+                    status: 'revealed',
+                    phones,
+                    primaryPhone: phones[0]?.number || null,
+                    primaryPhoneType: phones[0]?.type || null,
+                });
+            } catch (error) {
+                console.error('[reveal-phone] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // ── Shared-secret guard for protected routes ──
         const protectedPaths = ['/api/execute'];
         if (protectedPaths.includes(url.pathname) && request.method === 'POST') {
