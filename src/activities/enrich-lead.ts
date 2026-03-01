@@ -496,6 +496,22 @@ function extractContact(person: any, source: string): ContactInfo {
     };
 }
 
+/** Verify a LinkedIn URL actually exists (not 404). Returns the URL if valid, empty string if not. */
+async function verifyLinkedInUrl(url: string): Promise<string> {
+    if (!url || !url.includes('linkedin.com')) return url;
+    try {
+        const res = await fetchWithTimeout(url, { method: 'HEAD', redirect: 'follow' }, 4000);
+        if (res.status === 404 || res.status === 999) {
+            console.log(`⚠️ LinkedIn URL is invalid (${res.status}): ${url}`);
+            return '';
+        }
+        return url;
+    } catch {
+        // Network error or timeout — keep the URL, it might still be valid
+        return url;
+    }
+}
+
 // ─── Main Enrichment Pipeline ─────────────────────────────────────────
 export async function enrichLead(env: Env, input: EnrichInput): Promise<EnrichedLead> {
     console.log(`\n📊 ═══ MULTI-LAYER ENRICHMENT: ${input.company} ═══`);
@@ -531,8 +547,8 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
             }
         }
 
-        // STEP 3: Apollo People Search (by company + seniority) — gets MULTIPLE contacts
-        if (!emailFound) {
+        // STEP 3: Apollo People Search (by company + seniority) — ALWAYS run for other contacts
+        {
             const searchResult = await apolloPeopleSearch(env, input.company, exec.name);
             if (searchResult) {
                 if (searchResult.primary) {
@@ -545,8 +561,8 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                         lead.executiveName = primary.name || lead.executiveName;
                         lead.executiveTitle = primary.title || lead.executiveTitle;
                     }
-                    lead.phone = primary.phone || lead.phone;
-                    lead.linkedinUrl = primary.linkedinUrl || lead.linkedinUrl;
+                    lead.phone = lead.phone || primary.phone;
+                    lead.linkedinUrl = lead.linkedinUrl || primary.linkedinUrl;
                 }
                 // Collect other decision-makers
                 for (const p of searchResult.others) {
@@ -556,11 +572,11 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
             }
         }
 
-        // STEP 4: Apollo Org → Domain → People Search
-        if (!emailFound) {
+        // STEP 4: Apollo Org → Domain → People Search — ALWAYS run for company data + more contacts
+        if (!lead.companyDomain || otherContacts.length === 0) {
             const orgResult = await apolloOrgAndPeopleSearch(env, input.company, exec.name);
             if (orgResult) {
-                lead.companyDomain = orgResult.domain;
+                lead.companyDomain = orgResult.domain || lead.companyDomain;
                 if (orgResult.primary) {
                     const primary = extractContact(orgResult.primary, 'apollo_org_search');
                     if (primary.email && !emailFound) {
@@ -571,11 +587,18 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                         lead.executiveName = primary.name || lead.executiveName;
                         lead.executiveTitle = primary.title || lead.executiveTitle;
                     }
-                    lead.phone = primary.phone || lead.phone;
-                    lead.linkedinUrl = primary.linkedinUrl || lead.linkedinUrl;
+                    lead.phone = lead.phone || primary.phone;
+                    lead.linkedinUrl = lead.linkedinUrl || primary.linkedinUrl;
                 }
                 for (const p of orgResult.others) {
-                    otherContacts.push(extractContact(p, 'apollo_org_search'));
+                    // Avoid duplicate contacts
+                    const exists = otherContacts.some(oc =>
+                        oc.email === extractContact(p, '').email ||
+                        oc.name === extractContact(p, '').name
+                    );
+                    if (!exists) {
+                        otherContacts.push(extractContact(p, 'apollo_org_search'));
+                    }
                 }
                 orgData = orgResult.org || orgData;
             }
@@ -617,6 +640,18 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
         if (research) {
             lead.executiveResearch = research.text;
             lead.executiveResearchUrl = research.url;
+        }
+
+        // STEP 7: Verify LinkedIn URLs (filter out 404s)
+        if (lead.linkedinUrl) {
+            lead.linkedinUrl = await verifyLinkedInUrl(lead.linkedinUrl);
+        }
+        if (lead.otherContacts?.length) {
+            for (const c of lead.otherContacts) {
+                if (c.linkedinUrl) {
+                    c.linkedinUrl = await verifyLinkedInUrl(c.linkedinUrl);
+                }
+            }
         }
 
         // ─── Summary ──────────────────────────────────────────────

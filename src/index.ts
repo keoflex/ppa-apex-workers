@@ -102,6 +102,39 @@ export default {
             return jsonWithCors(results);
         }
 
+        // Raw Apollo response diagnostic
+        if (url.pathname === '/api/test-apollo-raw' && request.method === 'GET') {
+            try {
+                const res = await fetch('https://api.apollo.io/v1/people/match', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': env.APOLLO_API_KEY || '' },
+                    body: JSON.stringify({
+                        first_name: 'Glauber',
+                        last_name: 'Correa',
+                        organization_name: 'Agibank',
+                    }),
+                });
+                const data = await res.json() as any;
+                return jsonWithCors({
+                    status: res.status,
+                    hasEmail: !!data.person?.email,
+                    email: data.person?.email || null,
+                    hasPhoneNumbers: !!data.person?.phone_numbers?.length,
+                    phoneNumbers: data.person?.phone_numbers || [],
+                    phoneNumber: data.person?.phone_number || null,
+                    sanitizedPhone: data.person?.sanitized_phone || null,
+                    organizationName: data.person?.organization?.name || null,
+                    organizationDomain: data.person?.organization?.primary_domain || null,
+                    linkedinUrl: data.person?.linkedin_url || null,
+                    title: data.person?.title || null,
+                    seniority: data.person?.seniority || null,
+                    allPersonKeys: data.person ? Object.keys(data.person) : [],
+                });
+            } catch (err) {
+                return jsonWithCors({ error: String(err) });
+            }
+        }
+
         // ── Shared-secret guard for protected routes ──
         const protectedPaths = ['/api/execute'];
         if (protectedPaths.includes(url.pathname) && request.method === 'POST') {
@@ -389,8 +422,18 @@ export default {
                     emailConfidence: result.emailConfidence || 'none',
                     phone: result.phone || null,
                     linkedinUrl: result.linkedinUrl || null,
-                    otherContacts: result.otherContacts?.length || 0,
                     companyDomain: result.companyDomain || null,
+                    companyRevenue: result.companyRevenue || null,
+                    employeeCount: result.employeeCount || null,
+                    patternEmails: result.patternEmails || [],
+                    otherContacts: (result.otherContacts || []).map((c: any) => ({
+                        name: c.name,
+                        title: c.title,
+                        email: c.email,
+                        phone: c.phone,
+                        linkedinUrl: c.linkedinUrl || c.linkedin_url,
+                        seniority: c.seniority,
+                    })),
                 });
             } catch (error) {
                 console.error('[re-enrich] Error:', error);
