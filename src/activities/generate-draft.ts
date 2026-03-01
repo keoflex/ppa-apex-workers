@@ -11,7 +11,7 @@ export interface DraftInput {
     persona: string;
     triggerHeadline: string;
     triggerArticleText?: string;
-    partnerProfile?: any;
+    partnerProfiles?: any[];  // M:N — array of partner companies
 }
 
 export interface StrikeDraft {
@@ -97,11 +97,15 @@ export async function generateDraft(env: Env, input: DraftInput): Promise<Strike
 
 ABOUT YOUR FIRM:
 ${company_description || `${company_name} is a consulting and advisory firm specializing in strategic counsel for institutional clients navigating complex transactions, regulatory environments, and market transitions.`}
-${input.partnerProfile ? `
-CRITICAL STRATEGIC ALIGNMENT:
-This outreach is part of a specialized campaign on behalf of our key partner: ${input.partnerProfile.name}.
-Partner Value Proposition: ${input.partnerProfile.value_proposition}
-When crafting this outreach, you MUST naturally weave in how ${input.partnerProfile.name} can specifically help this executive address the challenges or opportunities created by this trigger event. Frame ${company_name} as the strategic advisor bringing this elite capability to the table.` : ''}
+${input.partnerProfiles && input.partnerProfiles.length > 0 ? `
+PARTNER SYNDICATE ALIGNMENT:
+You are operating as a Strategic Syndicate Director. This outreach is part of a multi-partner campaign. Evaluate the strengths of each partner below against the target's trigger event and weave the MOST RELEVANT partner capability into the email naturally. You do NOT need to mention every partner — focus on the 1-2 most strategic alignments.
+
+${input.partnerProfiles.map((p: any, i: number) => `Partner ${i + 1}: ${p.name}
+Positioning: ${p.partner_positioning || p.ai_summary || p.value_proposition || 'Strategic partner'}
+${p.domain ? `Domain: ${p.domain}` : ''}`).join('\n\n')}
+
+Frame ${company_name} as the strategic advisor orchestrating this syndicate of elite capabilities for the prospect.` : ''}
 
 WRITING STYLE RULES — THIS IS CRITICAL:
 1. Write like a thoughtful, experienced professional sending a brief personal note. NOT like a marketing email. NOT like a cold sales pitch. Think: a senior partner reaching out after reading about a deal in the morning paper.

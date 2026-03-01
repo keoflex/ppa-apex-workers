@@ -884,14 +884,19 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     const { data: settings } = await getRow(env, 'system_settings', 1);
                     const senderName = settings?.default_sender_name || persona || "Rob O'Neill";
 
-                    // Fetch Partner Profile if this strike belongs to a strategic campaign
-                    let partnerProfile = null;
+                    // Fetch Partner Profiles (M:N) if this strike belongs to a strategic campaign
+                    let partnerProfiles: any[] = [];
                     if (campaign.campaign_id) {
                         const { fetchRow } = await import('./utils/supabase');
-                        const cRows = await fetchRow(env, 'campaigns', 'id', campaign.campaign_id);
-                        if (cRows && cRows.length > 0 && cRows[0].partner_id) {
-                            const pRows = await fetchRow(env, 'partner_profiles', 'id', cRows[0].partner_id);
-                            if (pRows && pRows.length > 0) partnerProfile = pRows[0];
+                        // Query campaign_partners join table
+                        const cpUrl = `${env.SUPABASE_URL}/rest/v1/campaign_partners?campaign_id=eq.${campaign.campaign_id}&select=company_id`;
+                        const cpRes = await fetch(cpUrl, {
+                            headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
+                        });
+                        const cpRows = cpRes.ok ? await cpRes.json() as any[] : [];
+                        for (const cp of cpRows) {
+                            const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
+                            if (pRows && pRows.length > 0) partnerProfiles.push(pRows[0]);
                         }
                     }
 
@@ -899,7 +904,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         lead: enrichedLead,
                         persona: senderName,
                         triggerHeadline: lead.trigger_event,
-                        partnerProfile,
+                        partnerProfiles,
                     });
 
                     await patchRow(env, 'strike_campaigns', {
@@ -916,7 +921,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
 
                 let triggers = [];
                 let strategicCampaignId: string | null = null;
-                let partnerProfile: any = null;
+                let partnerProfiles: any[] = [];
 
                 if (action === 'dispatch_agent' && msg.body.agentId) {
                     const { fetchRow, patchRow } = await import('./utils/supabase');
@@ -927,14 +932,29 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         continue;
                     }
                     const agent = agentRows[0];
-                    strategicCampaignId = agent.campaign_id || null;
 
-                    if (strategicCampaignId) {
-                        const cRows = await fetchRow(env, 'campaigns', 'id', strategicCampaignId);
-                        if (cRows && cRows.length > 0 && cRows[0].partner_id) {
-                            const pRows = await fetchRow(env, 'partner_profiles', 'id', cRows[0].partner_id);
-                            if (pRows && pRows.length > 0) partnerProfile = pRows[0];
+                    // M:N: Query campaign_agents for all campaign assignments
+                    const caUrl = `${env.SUPABASE_URL}/rest/v1/campaign_agents?agent_id=eq.${msg.body.agentId}&select=campaign_id`;
+                    const caRes = await fetch(caUrl, {
+                        headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
+                    });
+                    const caRows = caRes.ok ? await caRes.json() as any[] : [];
+
+                    if (caRows.length > 0) {
+                        // Use first campaign assignment for this run
+                        strategicCampaignId = caRows[0].campaign_id;
+
+                        // Fetch all partners for this campaign via campaign_partners
+                        const cpUrl = `${env.SUPABASE_URL}/rest/v1/campaign_partners?campaign_id=eq.${strategicCampaignId}&select=company_id`;
+                        const cpRes = await fetch(cpUrl, {
+                            headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
+                        });
+                        const cpRows = cpRes.ok ? await cpRes.json() as any[] : [];
+                        for (const cp of cpRows) {
+                            const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
+                            if (pRows && pRows.length > 0) partnerProfiles.push(pRows[0]);
                         }
+                        console.log(`📋 Agent #${msg.body.agentId} → Campaign ${strategicCampaignId} with ${partnerProfiles.length} partners`);
                     }
 
                     triggers = await senseTriggersForAgent(env, agent);
@@ -989,7 +1009,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                             persona: persona || "Rob O'Neill",
                             triggerHeadline: selectedTrigger.headline,
                             triggerArticleText: selectedTrigger.articleText || '',
-                            partnerProfile,
+                            partnerProfiles,
                         });
 
                         // Step 4: Save lead + campaign to Supabase
