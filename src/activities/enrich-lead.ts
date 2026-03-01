@@ -16,6 +16,18 @@
 import type { Env } from '../index';
 import { patchRow } from '../utils/supabase';
 
+/** Fetch with timeout to avoid Cloudflare Worker 30s limit */
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { ...init, signal: controller.signal });
+        return res;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 export interface EnrichInput {
     company: string;
     executiveName: string;
@@ -53,7 +65,9 @@ export interface EnrichedLead {
 }
 
 const APOLLO_MATCH_URL = 'https://api.apollo.io/v1/people/match';
-const APOLLO_SEARCH_URL = 'https://api.apollo.io/v1/mixed_people/search';
+const APOLLO_SEARCH_URL = 'https://api.apollo.io/v1/mixed_people/api_search';
+const APOLLO_BULK_MATCH_URL = 'https://api.apollo.io/v1/people/bulk_match';
+const APOLLO_ORG_ENRICH_URL = 'https://api.apollo.io/v1/organizations/enrich';
 const APOLLO_ORG_SEARCH_URL = 'https://api.apollo.io/v1/mixed_companies/search';
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
 
@@ -85,7 +99,7 @@ async function identifyExecutive(
 
     console.log(`🧠 Asking Gemini: Who leads ${company}?`);
     try {
-        const res = await fetch(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+        const res = await fetchWithTimeout(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -133,7 +147,7 @@ async function apolloPeopleMatch(
     console.log(`🔍 Layer 2: Apollo People Match: ${firstName} ${lastName} at ${company}...`);
 
     try {
-        const res = await fetch(APOLLO_MATCH_URL, {
+        const res = await fetchWithTimeout(APOLLO_MATCH_URL, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -165,7 +179,7 @@ async function apolloPeopleMatch(
     return null;
 }
 
-// ─── Step 3: Apollo People Search (by company + seniority) ────────────
+// ─── Step 3: Apollo People Search (api_search → bulk_match) ───────────
 async function apolloPeopleSearch(
     env: Env,
     company: string,
@@ -176,7 +190,8 @@ async function apolloPeopleSearch(
     console.log(`🔍 Layer 3: Apollo People Search for decision-makers at ${company}...`);
 
     try {
-        const res = await fetch(APOLLO_SEARCH_URL, {
+        // Step 1: api_search returns partial profiles (no emails)
+        const res = await fetchWithTimeout(APOLLO_SEARCH_URL, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -190,42 +205,74 @@ async function apolloPeopleSearch(
             }),
         });
 
-        if (res.ok) {
-            const data = await res.json() as any;
-            const people = data.people || [];
-            console.log(`📥 Apollo Search returned ${people.length} contacts at ${company}`);
-
-            if (people.length === 0) return null;
-
-            // Try to find the target person first
-            let primary = null;
-            if (targetName && targetName !== 'Unknown') {
-                const targetLower = targetName.toLowerCase();
-                primary = people.find((p: any) =>
-                    `${p.first_name} ${p.last_name}`.toLowerCase().includes(targetLower) ||
-                    targetLower.includes(p.last_name?.toLowerCase())
-                );
-            }
-
-            // If target not found, pick the highest-ranking person with an email
-            if (!primary) {
-                primary = people.find((p: any) => p.email) || people[0];
-            }
-
-            // Collect other decision-makers we found
-            const others = people.filter((p: any) => p !== primary).slice(0, 5);
-
-            const org = primary?.organization || people[0]?.organization;
-
-            if (primary) {
-                console.log(`✅ Apollo Search found primary: ${primary.first_name} ${primary.last_name} (${primary.title}) | Email: ${primary.email || 'N/A'}`);
-                others.forEach((p: any) => {
-                    console.log(`   + Also found: ${p.first_name} ${p.last_name} (${p.title}) | Email: ${p.email || 'N/A'}`);
-                });
-            }
-
-            return { primary, others, org };
+        if (!res.ok) {
+            console.warn(`⚠️ Apollo api_search returned ${res.status}`);
+            return null;
         }
+
+        const data = await res.json() as any;
+        const partialPeople = data.people || [];
+        console.log(`📥 Apollo api_search returned ${partialPeople.length} partial profiles at ${company}`);
+
+        if (partialPeople.length === 0) return null;
+
+        // Step 2: bulk_match to enrich with emails/phones
+        const details = partialPeople.map((p: any) => ({
+            first_name: p.first_name,
+            last_name: p.last_name,
+            organization_name: p.organization?.name || company,
+            ...(p.linkedin_url ? { linkedin_url: p.linkedin_url } : {}),
+        }));
+
+        const bulkRes = await fetchWithTimeout(APOLLO_BULK_MATCH_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': env.APOLLO_API_KEY,
+            },
+            body: JSON.stringify({ details }),
+        });
+
+        let enrichedPeople = partialPeople;
+        if (bulkRes.ok) {
+            const bulkData = await bulkRes.json() as any;
+            const matches = bulkData.matches || [];
+            console.log(`📥 Bulk match returned ${matches.length} enriched profiles`);
+            // Merge enriched data back
+            enrichedPeople = matches.map((m: any, i: number) => ({
+                ...partialPeople[i],
+                ...(m || {}),
+            }));
+        } else {
+            console.warn(`⚠️ Bulk match returned ${bulkRes.status}, using partial data`);
+        }
+
+        // Try to find the target person first
+        let primary = null;
+        if (targetName && targetName !== 'Unknown') {
+            const targetLower = targetName.toLowerCase();
+            primary = enrichedPeople.find((p: any) =>
+                `${p.first_name} ${p.last_name}`.toLowerCase().includes(targetLower) ||
+                targetLower.includes(p.last_name?.toLowerCase())
+            );
+        }
+
+        // If target not found, pick the highest-ranking person with an email
+        if (!primary) {
+            primary = enrichedPeople.find((p: any) => p.email) || enrichedPeople[0];
+        }
+
+        const others = enrichedPeople.filter((p: any) => p !== primary).slice(0, 5);
+        const org = primary?.organization || enrichedPeople[0]?.organization;
+
+        if (primary) {
+            console.log(`✅ Apollo Search found primary: ${primary.first_name} ${primary.last_name} (${primary.title}) | Email: ${primary.email || 'N/A'}`);
+            others.forEach((p: any) => {
+                console.log(`   + Also found: ${p.first_name} ${p.last_name} (${p.title}) | Email: ${p.email || 'N/A'}`);
+            });
+        }
+
+        return { primary, others, org };
     } catch (err) {
         console.warn('⚠️ Apollo People Search failed:', err);
     }
@@ -233,7 +280,7 @@ async function apolloPeopleSearch(
     return null;
 }
 
-// ─── Step 4: Apollo Organization → domain → People ────────────────────
+// ─── Step 4: Apollo Organization enrich → domain → People ─────────────
 async function apolloOrgAndPeopleSearch(
     env: Env,
     company: string,
@@ -241,40 +288,62 @@ async function apolloOrgAndPeopleSearch(
 ): Promise<{ domain: string; primary: any; others: any[]; org: any } | null> {
     if (!env.APOLLO_API_KEY) return null;
 
-    console.log(`🔍 Layer 4: Apollo Org Search for ${company}...`);
+    console.log(`🔍 Layer 4: Apollo Org Enrich for ${company}...`);
 
     try {
-        // First find the organization to get its domain
-        const orgRes = await fetch(APOLLO_ORG_SEARCH_URL, {
+        // First try organizations/enrich with a domain guess
+        const domainGuess = company.toLowerCase().replace(/[^a-z0-9]/g, '') + '.com';
+        const orgRes = await fetchWithTimeout(APOLLO_ORG_ENRICH_URL, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'x-api-key': env.APOLLO_API_KEY,
             },
-            body: JSON.stringify({
-                q_organization_name: company,
-                per_page: 1,
-                page: 1,
-            }),
+            body: JSON.stringify({ domain: domainGuess }),
         });
 
-        if (!orgRes.ok) return null;
+        let targetOrg: any = null;
+        let domain = '';
 
-        const orgData = await orgRes.json() as any;
-        const organizations = orgData.organizations || orgData.accounts || [];
-        const targetOrg = organizations[0];
+        if (orgRes.ok) {
+            const orgData = await orgRes.json() as any;
+            targetOrg = orgData.organization;
+            domain = targetOrg?.primary_domain || targetOrg?.website_url || '';
+        }
+
+        // Fallback: try mixed_companies/search
+        if (!targetOrg) {
+            const searchRes = await fetchWithTimeout(APOLLO_ORG_SEARCH_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': env.APOLLO_API_KEY,
+                },
+                body: JSON.stringify({
+                    q_organization_name: company,
+                    per_page: 1,
+                    page: 1,
+                }),
+            });
+
+            if (searchRes.ok) {
+                const searchData = await searchRes.json() as any;
+                const organizations = searchData.organizations || searchData.accounts || [];
+                targetOrg = organizations[0];
+                domain = targetOrg?.primary_domain || targetOrg?.website_url || '';
+            }
+        }
 
         if (!targetOrg) {
-            console.log(`⚠️ Apollo Org Search: no org found for ${company}`);
+            console.log(`⚠️ Apollo Org: no org found for ${company}`);
             return null;
         }
 
-        const domain = targetOrg.primary_domain || targetOrg.website_url || '';
         console.log(`✅ Found org: ${targetOrg.name} | Domain: ${domain}`);
 
-        // Now search for people at this org by domain
+        // Now search for people at this org using api_search + bulk_match
         if (domain) {
-            const peopleRes = await fetch(APOLLO_SEARCH_URL, {
+            const peopleRes = await fetchWithTimeout(APOLLO_SEARCH_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -290,22 +359,48 @@ async function apolloOrgAndPeopleSearch(
 
             if (peopleRes.ok) {
                 const pData = await peopleRes.json() as any;
-                const people = pData.people || [];
-                console.log(`📥 Apollo domain search returned ${people.length} contacts at ${domain}`);
+                const partialPeople = pData.people || [];
+                console.log(`📥 Apollo domain search returned ${partialPeople.length} contacts at ${domain}`);
+
+                // Bulk match to get full profiles
+                let enrichedPeople = partialPeople;
+                if (partialPeople.length > 0) {
+                    const details = partialPeople.map((p: any) => ({
+                        first_name: p.first_name,
+                        last_name: p.last_name,
+                        organization_name: targetOrg.name || company,
+                    }));
+                    const bulkRes = await fetchWithTimeout(APOLLO_BULK_MATCH_URL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'x-api-key': env.APOLLO_API_KEY,
+                        },
+                        body: JSON.stringify({ details }),
+                    });
+                    if (bulkRes.ok) {
+                        const bulkData = await bulkRes.json() as any;
+                        const matches = bulkData.matches || [];
+                        enrichedPeople = matches.map((m: any, i: number) => ({
+                            ...partialPeople[i],
+                            ...(m || {}),
+                        }));
+                    }
+                }
 
                 let primary = null;
                 if (targetName && targetName !== 'Unknown') {
                     const targetLower = targetName.toLowerCase();
-                    primary = people.find((p: any) =>
+                    primary = enrichedPeople.find((p: any) =>
                         `${p.first_name} ${p.last_name}`.toLowerCase().includes(targetLower) ||
                         targetLower.includes(p.last_name?.toLowerCase())
                     );
                 }
                 if (!primary) {
-                    primary = people.find((p: any) => p.email) || people[0];
+                    primary = enrichedPeople.find((p: any) => p.email) || enrichedPeople[0];
                 }
 
-                const others = people.filter((p: any) => p !== primary).slice(0, 5);
+                const others = enrichedPeople.filter((p: any) => p !== primary).slice(0, 5);
 
                 return { domain, primary, others, org: targetOrg };
             }
@@ -355,7 +450,7 @@ async function exaDeepResearch(
     console.log(`🕵️ Layer 6: Exa deep research: ${name} at ${company}...`);
 
     try {
-        const res = await fetch('https://api.exa.ai/search', {
+        const res = await fetchWithTimeout('https://api.exa.ai/search', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',

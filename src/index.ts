@@ -66,6 +66,42 @@ export default {
             });
         }
 
+        // Apollo diagnostic test
+        if (url.pathname === '/api/test-apollo' && request.method === 'GET') {
+            const hasKey = !!env.APOLLO_API_KEY;
+            const keyPrefix = env.APOLLO_API_KEY ? env.APOLLO_API_KEY.substring(0, 8) + '...' : 'NOT SET';
+            const results: Record<string, any> = { apolloKeyPresent: hasKey, apolloKeyPrefix: keyPrefix };
+
+            const endpoints = [
+                { name: 'people/match', url: 'https://api.apollo.io/v1/people/match', body: { first_name: 'Satya', last_name: 'Nadella', organization_name: 'Microsoft' } },
+                { name: 'people/search', url: 'https://api.apollo.io/v1/people/search', body: { q_organization_name: 'Microsoft', person_seniorities: ['c_suite'], per_page: 2 } },
+                { name: 'mixed_people/search', url: 'https://api.apollo.io/v1/mixed_people/search', body: { q_organization_name: 'Microsoft', person_seniorities: ['c_suite'], per_page: 2 } },
+                { name: 'organizations/enrich', url: 'https://api.apollo.io/v1/organizations/enrich', body: { domain: 'microsoft.com' } },
+                { name: 'mixed_companies/search', url: 'https://api.apollo.io/v1/mixed_companies/search', body: { q_organization_name: 'Microsoft', per_page: 1 } },
+            ];
+
+            for (const ep of endpoints) {
+                try {
+                    const r = await fetch(ep.url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': env.APOLLO_API_KEY || '' },
+                        body: JSON.stringify(ep.body),
+                    });
+                    const data = await r.json() as any;
+                    results[ep.name] = {
+                        status: r.status,
+                        accessible: r.status !== 403,
+                        error: data.error || null,
+                        sampleData: data.person?.email || data.people?.[0]?.email || data.organization?.name || 'check response',
+                    };
+                } catch (err) {
+                    results[ep.name] = { error: String(err) };
+                }
+            }
+
+            return jsonWithCors(results);
+        }
+
         // ── Shared-secret guard for protected routes ──
         const protectedPaths = ['/api/execute'];
         if (protectedPaths.includes(url.pathname) && request.method === 'POST') {
