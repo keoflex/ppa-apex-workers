@@ -69,7 +69,7 @@ const APOLLO_SEARCH_URL = 'https://api.apollo.io/v1/mixed_people/api_search';
 const APOLLO_BULK_MATCH_URL = 'https://api.apollo.io/v1/people/bulk_match';
 const APOLLO_ORG_ENRICH_URL = 'https://api.apollo.io/v1/organizations/enrich';
 const APOLLO_ORG_SEARCH_URL = 'https://api.apollo.io/v1/mixed_companies/search';
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
+import { GEMINI_REST_URL as GEMINI_URL } from '../config/gemini';
 
 function buildFallback(input: EnrichInput): EnrichedLead {
     return {

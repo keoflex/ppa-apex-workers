@@ -58,8 +58,7 @@ function keywordTriage(input: TriageInput): TriageResult {
 // Gemini REST endpoint (JSON mode)
 // ---------------------------------------------------------------------------
 
-const GEMINI_REST_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
+import { GEMINI_REST_URL } from '../config/gemini';
 
 const VALID_CATEGORIES: TriageCategory[] = [
     'direct_strike',

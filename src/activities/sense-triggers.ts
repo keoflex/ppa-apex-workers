@@ -52,8 +52,7 @@ const EXA_QUERIES = [
     `"IPO" OR "SPAC" OR "public offering" OR "regulatory approval" financial institution ${CURRENT_YEAR}`,
 ] as const;
 
-const GEMINI_REST_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
+import { GEMINI_REST_URL } from '../config/gemini';
 
 // ---------------------------------------------------------------------------
 // Extracted Data Type

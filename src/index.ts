@@ -9,7 +9,9 @@
 import { HitlGateDurableObject } from './durable-objects/hitl-gate';
 import { senseTriggers, senseTriggersForAgent } from './activities/sense-triggers';
 import { enrichLead, type EnrichedLead } from './activities/enrich-lead';
+import type { DraftInput } from './activities/generate-draft';
 import { generateDraft } from './activities/generate-draft';
+import { geminiUrl, GEMINI_REST_URL } from './config/gemini';
 import { executeCampaign } from './activities/execute-campaign';
 import { triageReply } from './activities/triage-reply';
 import { insertRow, patchRow, fetchRow } from './utils/supabase';
@@ -322,7 +324,7 @@ export default {
 
                 console.log(`🧠 AI Resync requested for ${body.companyName}`);
 
-                const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
+                const GEMINI_URL = GEMINI_REST_URL;
 
                 const systemPrompt = `You are a strategic business intelligence analyst. Research and generate a concise but comprehensive profile of the specified company.
 
@@ -569,7 +571,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                 ).join('\n\n');
 
                 const geminiRes = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${env.GEMINI_API_KEY}`,
+                    geminiUrl(env.GEMINI_API_KEY),
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },

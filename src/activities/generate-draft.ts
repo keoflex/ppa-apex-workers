@@ -27,8 +27,7 @@ import { getRow } from '../utils/supabase';
 
 // ---------------------------------------------------------------------------
 
-const GEMINI_REST_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
+import { GEMINI_REST_URL } from '../config/gemini';
 
 // ---------------------------------------------------------------------------
 // Fallback template — used when Gemini call fails
