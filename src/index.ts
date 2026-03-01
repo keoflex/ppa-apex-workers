@@ -213,7 +213,8 @@ export default {
             }
         }
 
-        // Enrich a CRM contact via Apollo people/match (find email, phone, LinkedIn)
+        // Enrich a CRM contact via Apollo (find email, phone, LinkedIn)
+        // Strategy: try people/match first, fall back to people/search for partial names
         if (url.pathname === '/api/enrich-contact' && request.method === 'POST') {
             try {
                 const body = await request.json() as {
@@ -224,46 +225,68 @@ export default {
                     title?: string;
                 };
 
-                console.log(`🔍 Contact enrich requested for ${body.firstName} ${body.lastName} at ${body.organizationName}`);
+                console.log(`🔍 Contact enrich: ${body.firstName} ${body.lastName} at ${body.organizationName} (domain: ${body.domain || 'none'})`);
 
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 10000);
+                let person: any = null;
 
-                const res = await fetch('https://api.apollo.io/v1/people/match', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': env.APOLLO_API_KEY || '',
-                    },
-                    body: JSON.stringify({
-                        first_name: body.firstName,
-                        last_name: body.lastName,
-                        organization_name: body.organizationName,
-                        ...(body.domain ? { domain: body.domain } : {}),
-                        ...(body.title ? { title: body.title } : {}),
-                    }),
-                    signal: controller.signal,
-                });
-
-                clearTimeout(timeout);
-
-                if (!res.ok) {
-                    const errBody = await res.text().catch(() => '');
-                    console.error(`[enrich-contact] Apollo returned ${res.status}: ${errBody}`);
-                    return jsonWithCors({ error: `Apollo returned ${res.status}`, detail: errBody }, { status: 502 });
+                // Strategy 1: people/match (best when we have first + last name)
+                if (body.firstName && body.lastName) {
+                    const matchRes = await fetch('https://api.apollo.io/v1/people/match', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': env.APOLLO_API_KEY || '' },
+                        body: JSON.stringify({
+                            first_name: body.firstName, last_name: body.lastName,
+                            organization_name: body.organizationName,
+                            ...(body.domain ? { domain: body.domain } : {}),
+                        }),
+                    });
+                    if (matchRes.ok) {
+                        const matchData = await matchRes.json() as any;
+                        if (matchData.person) person = matchData.person;
+                    }
                 }
 
-                const data = await res.json() as any;
-                const person = data.person;
+                // Strategy 2: people/search (works with partial names, uses org + title)
+                if (!person) {
+                    console.log('🔍 Falling back to people/search...');
+                    const searchBody: any = {
+                        person_titles: body.title ? [body.title] : [],
+                        q_organization_name: body.organizationName || undefined,
+                        q_person_name: `${body.firstName}${body.lastName ? ' ' + body.lastName : ''}`,
+                        per_page: 3,
+                        page: 1,
+                    };
+                    if (body.domain) {
+                        searchBody.organization_domains = [body.domain];
+                    }
+
+                    const searchRes = await fetch('https://api.apollo.io/v1/mixed_people/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': env.APOLLO_API_KEY || '' },
+                        body: JSON.stringify(searchBody),
+                    });
+
+                    if (searchRes.ok) {
+                        const searchData = await searchRes.json() as any;
+                        const people = searchData.people || [];
+                        if (people.length > 0) {
+                            // Pick best match: prefer same org
+                            person = people.find((p: any) =>
+                                p.organization?.name?.toLowerCase().includes(body.organizationName.toLowerCase())
+                            ) || people[0];
+                        }
+                    }
+                }
 
                 if (!person) {
                     return jsonWithCors({ status: 'not_found', message: 'No match found in Apollo' });
                 }
 
                 const phones = (person.phone_numbers || []).map((p: any) => ({
-                    number: p.sanitized_number || p.raw_number || '',
-                    type: p.type || 'unknown',
+                    number: p.sanitized_number || p.raw_number || '', type: p.type || 'unknown',
                 })).filter((p: any) => p.number);
+
+                const fullName = [person.first_name, person.last_name].filter(Boolean).join(' ') || null;
 
                 return jsonWithCors({
                     status: 'found',
@@ -271,6 +294,7 @@ export default {
                     phone: phones[0]?.number || null,
                     linkedin_url: person.linkedin_url || null,
                     title: person.title || null,
+                    full_name: fullName,
                     headline: person.headline || null,
                     city: person.city || null,
                     state: person.state || null,
@@ -282,6 +306,76 @@ export default {
                     return jsonWithCors({ error: 'Apollo enrich timed out (10s)' }, { status: 504 });
                 }
                 console.error('[enrich-contact] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // AI Resync — Generate company intelligence via Gemini
+        if (url.pathname === '/api/ai-resync' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    companyName: string;
+                    domain?: string;
+                    industry?: string;
+                    existingSummary?: string;
+                };
+
+                console.log(`🧠 AI Resync requested for ${body.companyName}`);
+
+                const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent';
+
+                const systemPrompt = `You are a strategic business intelligence analyst. Research and generate a concise but comprehensive profile of the specified company.
+
+OUTPUT FORMAT: Respond with a JSON object ONLY (no markdown):
+{
+  "summary": "3-4 sentence strategic intelligence brief covering: what the company does, their market position, key differentiators, and any notable recent developments or strategic moves. Be specific and factual.",
+  "industry": "Primary industry classification (e.g. 'Financial Technology', 'Enterprise SaaS')",
+  "revenue": "Estimated revenue range if inferable (e.g. '$1B-5B', '$50M+'), or null",
+  "headcount": "Estimated headcount range if inferable (e.g. '5,000-10,000', '200+'), or null"
+}`;
+
+                const userPrompt = `Company: ${body.companyName}
+${body.domain ? `Domain: ${body.domain}` : ''}
+${body.industry ? `Known Industry: ${body.industry}` : ''}
+${body.existingSummary ? `Existing Intel (enrich and expand): ${body.existingSummary}` : ''}
+
+Generate a strategic intelligence profile for this company. Be factual, specific, and concise.`;
+
+                const geminiRes = await fetch(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        system_instruction: { parts: [{ text: systemPrompt }] },
+                        contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+                        generationConfig: { temperature: 0.7, maxOutputTokens: 512, responseMimeType: 'application/json' },
+                    }),
+                });
+
+                if (!geminiRes.ok) {
+                    const errText = await geminiRes.text();
+                    console.error(`[ai-resync] Gemini error ${geminiRes.status}: ${errText}`);
+                    return jsonWithCors({ error: `Gemini API error ${geminiRes.status}` }, { status: 502 });
+                }
+
+                const geminiData = await geminiRes.json() as any;
+                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+                const rawText = parts.find((p: any) => p.text)?.text;
+
+                if (!rawText) {
+                    return jsonWithCors({ error: 'Gemini returned empty response' }, { status: 502 });
+                }
+
+                const parsed = JSON.parse(rawText);
+                console.log(`✅ AI Resync complete for ${body.companyName}`);
+
+                return jsonWithCors({
+                    summary: parsed.summary || null,
+                    industry: parsed.industry || null,
+                    revenue: parsed.revenue || null,
+                    headcount: parsed.headcount || null,
+                });
+            } catch (error: any) {
+                console.error('[ai-resync] Error:', error);
                 return jsonWithCors({ error: String(error) }, { status: 500 });
             }
         }
