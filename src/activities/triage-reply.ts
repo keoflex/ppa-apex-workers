@@ -59,7 +59,7 @@ function keywordTriage(input: TriageInput): TriageResult {
 // ---------------------------------------------------------------------------
 
 const GEMINI_REST_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
 
 const VALID_CATEGORIES: TriageCategory[] = [
     'direct_strike',
@@ -137,7 +137,9 @@ Classify this reply now.`;
             }>;
         };
 
-        const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+        // Gemini 3 may return multiple parts (text + thoughtSignature). Find the text part.
+        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+        const rawText = parts.find((p: any) => p.text)?.text;
         if (!rawText) {
             throw new Error('Gemini returned an empty response');
         }
@@ -165,7 +167,7 @@ Classify this reply now.`;
             category: parsed.triage_category,
             confidence,
             reasoning,
-            modelUsed: 'gemini-2.0-flash',
+            modelUsed: 'gemini-3-flash-preview',
         };
 
         console.log(`✅ Triaged as: ${result.category} (${result.confidence.toFixed(2)} confidence) — Gemini`);

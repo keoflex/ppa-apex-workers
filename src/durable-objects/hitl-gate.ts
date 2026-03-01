@@ -71,8 +71,19 @@ export class HitlGateDurableObject {
             await this.state.storage.put('gate', gate);
             console.log(`✅ HITL Gate APPROVED | Campaign #${gate.campaignId}`);
 
-            // In production: trigger delivery via Queue or direct API call
-            // await this.env.STRIKE_QUEUE?.send({ campaignId: gate.campaignId, action: 'deliver' });
+            // Trigger campaign delivery via Queue
+            if (this.env.STRIKE_QUEUE) {
+                try {
+                    await this.env.STRIKE_QUEUE.send({
+                        campaignId: gate.campaignId,
+                        persona: gate.persona,
+                        source: 'hitl_approved',
+                    });
+                    console.log(`📤 Delivery queued for Campaign #${gate.campaignId}`);
+                } catch (queueErr) {
+                    console.warn('⚠️ Queue send failed (non-blocking):', queueErr);
+                }
+            }
 
             return Response.json({ status: 'approved', gate });
         }

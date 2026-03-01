@@ -8,12 +8,15 @@ import type { Env } from '../index';
 export interface MarketTrigger {
     triggerId: string;
     source: string;
+    sourceUrl: string;
     headline: string;
     company: string;
     executiveName: string;
     executiveTitle: string;
     relevanceScore: number;
     detectedAt: string;
+    articleText?: string;
+    agentId: number; // 1-5, maps to EXA_QUERIES index + 1
 }
 
 // ---------------------------------------------------------------------------
@@ -39,37 +42,28 @@ interface ExaSearchResponse {
 // Search queries — five signal buckets that matter to PPA+ outreach
 // ---------------------------------------------------------------------------
 
+const CURRENT_YEAR = new Date().getFullYear().toString();
+
 const EXA_QUERIES = [
-    'mergers and acquisitions announcement 2025 financial services',
-    'new private equity fund launch capital raise 2025',
-    'executive transition appointment CFO CIO managing director 2025',
-    'infrastructure investment award municipal government contract 2025',
-    'regulatory filing SEC CFTC alternative investment 2025',
+    `"acquisition" OR "merger" OR "deal closed" financial services bank ${CURRENT_YEAR} announcement`,
+    `"raises" OR "closes fund" OR "launch" private equity venture capital billion million ${CURRENT_YEAR}`,
+    `"appointed" OR "named" OR "hires" CEO CFO CIO "managing director" asset management financial services ${CURRENT_YEAR}`,
+    `"strategic partnership" OR "joint venture" OR "advisory" investment bank deal ${CURRENT_YEAR}`,
+    `"IPO" OR "SPAC" OR "public offering" OR "regulatory approval" financial institution ${CURRENT_YEAR}`,
 ] as const;
 
+const GEMINI_REST_URL =
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
+
 // ---------------------------------------------------------------------------
-// Extract a rough company name and executive name from Exa result text
+// Extracted Data Type
 // ---------------------------------------------------------------------------
 
-function extractMeta(result: ExaResult): { company: string; executiveName: string; executiveTitle: string } {
-    // Best-effort extraction — Exa text may contain rich context
-    const text = result.text ?? result.highlights?.join(' ') ?? result.title;
-
-    // Company: use the domain (hostname minus www. / .com)
-    let company = 'Unknown Company';
-    try {
-        const hostname = new URL(result.url).hostname.replace(/^www\./, '').split('.')[0];
-        company = hostname.charAt(0).toUpperCase() + hostname.slice(1);
-    } catch {
-        /* ignore malformed URLs */
-    }
-
-    // Try to pull a person-like pattern ("FirstName LastName, Title") from text
-    const personMatch = text.match(/([A-Z][a-z]+ [A-Z][a-z]+),\s*([A-Z][^.,]{3,40})/);
-    const executiveName = personMatch ? personMatch[1] : 'Key Decision-Maker';
-    const executiveTitle = personMatch ? personMatch[2].trim() : 'Executive';
-
-    return { company, executiveName, executiveTitle };
+interface ExtractedMeta {
+    index: number;
+    company: string;
+    executiveName: string;
+    executiveTitle: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,10 +75,14 @@ export async function senseTriggers(env: Env): Promise<MarketTrigger[]> {
 
     const triggers: MarketTrigger[] = [];
 
-    // Fan out across all query buckets, collect results, ignore individual failures
-    const queryResults = await Promise.allSettled(
-        EXA_QUERIES.map((query) =>
-            fetch('https://api.exa.ai/search', {
+    // Run all query buckets sequentially — track which agent (query) found each result
+    const allExaResults: ExaResult[] = [];
+    const resultAgentMap: number[] = []; // parallel array: agentId for each result
+    for (let qi = 0; qi < EXA_QUERIES.length; qi++) {
+        const query = EXA_QUERIES[qi];
+        const agentId = qi + 1; // agents are 1-indexed in DB
+        try {
+            const res = await fetch('https://api.exa.ai/search', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -95,50 +93,147 @@ export async function senseTriggers(env: Env): Promise<MarketTrigger[]> {
                     numResults: 3,
                     type: 'neural',
                     useAutoprompt: true,
-                    // Request text highlights for better extraction
+                    startPublishedDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+                    excludeDomains: [
+                        'wikipedia.org',
+                        'investopedia.com',
+                        'britannica.com',
+                        'wikiwand.com',
+                        'reddit.com',
+                        'quora.com',
+                    ],
                     contents: {
-                        text: { maxCharacters: 800 },
+                        text: { maxCharacters: 1500 },
                         highlights: { numSentences: 2, highlightsPerUrl: 1 },
                     },
                 }),
-            })
-                .then(async (res) => {
-                    if (!res.ok) {
-                        const errBody = await res.text();
-                        throw new Error(`Exa error ${res.status}: ${errBody}`);
-                    }
-                    return res.json() as Promise<ExaSearchResponse>;
-                })
-        )
-    );
+            });
 
-    for (const settled of queryResults) {
-        if (settled.status === 'rejected') {
-            console.warn('⚠️ Exa query failed:', settled.reason);
+            if (!res.ok) {
+                const errBody = await res.text();
+                console.warn(`⚠️ Exa query ${agentId} failed (${res.status}): ${errBody}`);
+                continue;
+            }
+
+            const data = await res.json() as ExaSearchResponse;
+            if (Array.isArray(data.results)) {
+                for (const r of data.results) {
+                    allExaResults.push(r);
+                    resultAgentMap.push(agentId);
+                }
+                console.log(`🤖 Agent ${agentId}: found ${data.results.length} results`);
+            }
+        } catch (err) {
+            console.warn(`⚠️ Exa query ${agentId} exception:`, err);
+        }
+    }
+
+    if (allExaResults.length === 0) {
+        console.warn('⚠️ No Exa results found across any queries.');
+        return [];
+    }
+
+    // Post-filter: remove any Wikipedia/encyclopedia URLs that slipped through
+    const blockedDomains = ['wikipedia.org', 'investopedia.com', 'britannica.com', 'wikiwand.com', 'wikidata.org', 'dbpedia.org'];
+    const filteredResults: ExaResult[] = [];
+    const filteredAgentMap: number[] = [];
+    for (let i = 0; i < allExaResults.length; i++) {
+        const url = (allExaResults[i].url || '').toLowerCase();
+        const blocked = blockedDomains.some(d => url.includes(d));
+        if (blocked) {
+            console.log(`🚫 Filtered out non-news URL: ${allExaResults[i].url}`);
+        } else {
+            filteredResults.push(allExaResults[i]);
+            filteredAgentMap.push(resultAgentMap[i]);
+        }
+    }
+
+    if (filteredResults.length === 0) {
+        console.warn('⚠️ All Exa results filtered out (non-news sources).');
+        return [];
+    }
+
+    console.log(`📊 ${filteredResults.length} results after domain filtering (from ${allExaResults.length} raw)`);
+
+    // 2. Batch all results and ask Gemini to extract the names
+    const itemsPrompt = filteredResults.map((r, i) =>
+        `[Item ${i}]\nTitle: ${r.title}\nText: ${r.text ?? r.highlights?.join(' ') ?? ''}\nURL: ${r.url}`
+    ).join('\n\n');
+
+    const systemPrompt = `You are a precise data extraction AI for business development. Given news articles, extract:
+1. The PRIMARY COMPANY involved in the deal/event (the one a consulting firm would want to contact)
+2. The HIGHEST-RANKING EXECUTIVE mentioned by name in the article
+
+CRITICAL RULES FOR EXECUTIVE NAME EXTRACTION:
+- Look carefully for ANY named person in the article — CEOs, CFOs, Presidents, Chairmen, Managing Directors, Partners, Founders
+- Names often appear in quotes, bylines, or phrases like "said CEO John Smith" or "led by Managing Director Jane Doe"
+- If a press release mentions the company, look for the executive who signed it or is quoted
+- If the article mentions multiple people, pick the most senior one
+- ONLY return "Unknown" if truly NO human name appears anywhere in the text
+- DO NOT use "Key Decision-Maker" or any other placeholder — either a real name or "Unknown"
+
+Respond with ONLY a JSON array:
+[
+  { "index": 0, "company": "Company Name", "executiveName": "First Last", "executiveTitle": "CEO" }
+]`;
+
+    let extractedData: ExtractedMeta[] = [];
+    try {
+        const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                system_instruction: { parts: [{ text: systemPrompt }] },
+                contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
+                generationConfig: {
+                    temperature: 0.1,
+                    responseMimeType: 'application/json',
+                },
+            }),
+        });
+
+        if (!geminiRes.ok) throw new Error(await geminiRes.text());
+
+        const geminiData = await geminiRes.json() as any;
+        // Gemini 3 may return multiple parts (text + thoughtSignature). Find the text part.
+        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+        const rawText = parts.find((p: any) => p.text)?.text;
+        console.log(`🤖 Gemini extraction: ${parts.length} parts, text length: ${rawText?.length || 0}`);
+
+        if (rawText) {
+            extractedData = JSON.parse(rawText) as ExtractedMeta[];
+            console.log(`📋 Extracted ${extractedData.length} meta entries from Gemini`);
+        }
+    } catch (err) {
+        console.error('❌ Gemini extraction failed:', err);
+        return []; // Fail safe, don't generate garbage triggers
+    }
+
+    // 3. Re-assemble triggers — allow "Unknown" names, Apollo will resolve them later
+    for (const meta of extractedData) {
+        const result = filteredResults[meta.index];
+        if (!result) continue;
+
+        // Only discard explicitly bad placeholders
+        const nameLower = meta.executiveName.toLowerCase();
+        if (nameLower.includes('decision-maker')) {
+            console.log(`🗑️ Discarding trigger (placeholder name): ${result.title}`);
             continue;
         }
 
-        const data = settled.value;
-        if (!Array.isArray(data?.results)) continue;
-
-        for (const result of data.results) {
-            try {
-                const { company, executiveName, executiveTitle } = extractMeta(result);
-                triggers.push({
-                    triggerId: `trg-${crypto.randomUUID().slice(0, 8)}`,
-                    source: 'Exa.ai',
-                    headline: result.title ?? 'Market event detected',
-                    company,
-                    executiveName,
-                    executiveTitle,
-                    // Exa scores typically 0–1; multiply to an integer 0–100
-                    relevanceScore: Math.round((result.score ?? 0.7) * 100),
-                    detectedAt: result.publishedDate ?? new Date().toISOString(),
-                });
-            } catch (mapErr) {
-                console.warn('⚠️ Failed to map Exa result:', mapErr);
-            }
-        }
+        triggers.push({
+            triggerId: `trg-${crypto.randomUUID().slice(0, 8)}`,
+            source: 'Exa.ai',
+            sourceUrl: result.url ?? '',
+            headline: result.title ?? 'Market event detected',
+            company: meta.company,
+            executiveName: meta.executiveName,
+            executiveTitle: meta.executiveTitle,
+            relevanceScore: Math.round((result.score ?? 0.7) * 100),
+            detectedAt: result.publishedDate ?? new Date().toISOString(),
+            articleText: result.text || result.highlights?.join(' ') || '',
+            agentId: filteredAgentMap[meta.index] || 1,
+        });
     }
 
     // Sort descending by relevance, keep top 10
@@ -147,4 +242,165 @@ export async function senseTriggers(env: Env): Promise<MarketTrigger[]> {
 
     console.log(`✅ Detected ${top.length} market triggers from Exa.ai`);
     return top;
+}
+
+export async function senseTriggersForAgent(env: Env, agent: any): Promise<MarketTrigger[]> {
+    console.log(`🔍 Sensing market triggers for custom agent: ${agent.name} (#${agent.id})...`);
+
+    const triggers: MarketTrigger[] = [];
+
+    // Run the specific agent query
+    const allExaResults: ExaResult[] = [];
+    const query = agent.exa_query;
+    if (!query) {
+        console.warn(`⚠️ Agent #${agent.id} has no exa_query defined.`);
+        return [];
+    }
+
+    try {
+        const res = await fetch('https://api.exa.ai/search', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': env.EXA_API_KEY,
+            },
+            body: JSON.stringify({
+                query,
+                numResults: agent.max_leads_per_run || 5, // use configured limit
+                type: 'neural',
+                useAutoprompt: true,
+                startPublishedDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+                excludeDomains: [
+                    'wikipedia.org',
+                    'investopedia.com',
+                    'britannica.com',
+                    'wikiwand.com',
+                    'reddit.com',
+                    'quora.com',
+                ],
+                contents: {
+                    text: { maxCharacters: 1500 },
+                    highlights: { numSentences: 2, highlightsPerUrl: 1 },
+                },
+            }),
+        });
+
+        if (!res.ok) {
+            const errBody = await res.text();
+            console.warn(`⚠️ Exa custom query failed (${res.status}): ${errBody}`);
+            return [];
+        }
+
+        const data = await res.json() as ExaSearchResponse;
+        if (Array.isArray(data.results)) {
+            allExaResults.push(...data.results);
+            console.log(`🤖 Custom Agent ${agent.id} found ${data.results.length} results`);
+        }
+    } catch (err) {
+        console.warn(`⚠️ Exa custom query exception:`, err);
+        return [];
+    }
+
+    if (allExaResults.length === 0) {
+        console.warn(`⚠️ No Exa results found for agent #${agent.id}.`);
+        return [];
+    }
+
+    // Post-filter: remove encyclopedias
+    const blockedDomains = ['wikipedia.org', 'investopedia.com', 'britannica.com', 'wikiwand.com', 'wikidata.org', 'dbpedia.org'];
+    const filteredResults: ExaResult[] = [];
+    for (let i = 0; i < allExaResults.length; i++) {
+        const url = (allExaResults[i].url || '').toLowerCase();
+        const blocked = blockedDomains.some(d => url.includes(d));
+        if (blocked) {
+            console.log(`🚫 Filtered out non-news URL: ${allExaResults[i].url}`);
+        } else {
+            filteredResults.push(allExaResults[i]);
+        }
+    }
+
+    if (filteredResults.length === 0) {
+        console.warn('⚠️ All Exa results filtered out (non-news sources).');
+        return [];
+    }
+
+    // 2. Extractor with Gemini
+    const itemsPrompt = filteredResults.map((r, i) =>
+        `[Item ${i}]\nTitle: ${r.title}\nText: ${r.text ?? r.highlights?.join(' ') ?? ''}\nURL: ${r.url}`
+    ).join('\n\n');
+
+    const systemPrompt = `You are a precise data extraction AI for business development. Given news articles, extract:
+1. The PRIMARY COMPANY involved in the deal/event (the one a consulting firm would want to contact)
+2. The HIGHEST-RANKING EXECUTIVE mentioned by name in the article
+
+CRITICAL RULES FOR EXECUTIVE NAME EXTRACTION:
+- Look carefully for ANY named person in the article — CEOs, CFOs, Presidents, Chairmen, Managing Directors, Partners, Founders
+- Names often appear in quotes, bylines, or phrases like "said CEO John Smith" or "led by Managing Director Jane Doe"
+- If a press release mentions the company, look for the executive who signed it or is quoted
+- If the article mentions multiple people, pick the most senior one
+- ONLY return "Unknown" if truly NO human name appears anywhere in the text
+- DO NOT use "Key Decision-Maker" or any other placeholder — either a real name or "Unknown"
+
+Respond with ONLY a JSON array:
+[
+  { "index": 0, "company": "Company Name", "executiveName": "First Last", "executiveTitle": "CEO" }
+]`;
+
+    let extractedData: ExtractedMeta[] = [];
+    try {
+        const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                system_instruction: { parts: [{ text: systemPrompt }] },
+                contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
+                generationConfig: {
+                    temperature: 0.1,
+                    responseMimeType: 'application/json',
+                },
+            }),
+        });
+
+        if (!geminiRes.ok) throw new Error(await geminiRes.text());
+
+        const geminiData = await geminiRes.json() as any;
+        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+        const rawText = parts.find((p: any) => p.text)?.text;
+
+        if (rawText) {
+            extractedData = JSON.parse(rawText) as ExtractedMeta[];
+        }
+    } catch (err) {
+        console.error('❌ Gemini extraction failed:', err);
+        return [];
+    }
+
+    // 3. Re-assemble triggers
+    for (const meta of extractedData) {
+        const result = filteredResults[meta.index];
+        if (!result) continue;
+
+        const nameLower = meta.executiveName.toLowerCase();
+        if (nameLower.includes('decision-maker')) {
+            continue;
+        }
+
+        triggers.push({
+            triggerId: `trg-${crypto.randomUUID().slice(0, 8)}`,
+            source: 'Exa.ai',
+            sourceUrl: result.url ?? '',
+            headline: result.title ?? 'Market event detected',
+            company: meta.company,
+            executiveName: meta.executiveName,
+            executiveTitle: meta.executiveTitle,
+            relevanceScore: Math.round((result.score ?? 0.7) * 100),
+            detectedAt: result.publishedDate ?? new Date().toISOString(),
+            articleText: result.text || result.highlights?.join(' ') || '',
+            agentId: agent.id, // Set the current agent ID
+        });
+    }
+
+    triggers.sort((a, b) => b.relevanceScore - a.relevanceScore);
+    const resultCount = agent.max_leads_per_run || 5;
+    return triggers.slice(0, resultCount);
 }

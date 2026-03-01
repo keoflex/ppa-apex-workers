@@ -1,6 +1,6 @@
 /**
  * Activity: Generate Strike Draft
- * Drafts a personalized trust-proxy cold email using Gemini 2.0 Flash via REST.
+ * Drafts a personalized trust-proxy cold email using Gemini 3 Flash via REST.
  * Uses native fetch — no Node.js built-ins, compatible with Cloudflare Workers.
  */
 import type { Env } from '../index';
@@ -10,6 +10,8 @@ export interface DraftInput {
     lead: EnrichedLead;
     persona: string;
     triggerHeadline: string;
+    triggerArticleText?: string;
+    partnerProfile?: any;
 }
 
 export interface StrikeDraft {
@@ -21,54 +23,39 @@ export interface StrikeDraft {
 }
 
 // ---------------------------------------------------------------------------
-// Persona config
+import { getRow } from '../utils/supabase';
+
 // ---------------------------------------------------------------------------
 
-const PERSONA_SIGNATURES: Record<string, { name: string; title: string; group: string; bio: string }> = {
-    "Rob O'Neill": {
-        name: "Rob O'Neill",
-        title: 'Senior Strategic Advisor',
-        group: 'PPA+ Institutional Group',
-        bio: 'Former Navy SEAL, decorated veteran, nationally recognized speaker and strategist with deep relationships across institutional capital markets.',
-    },
-    'Bo Dietl': {
-        name: 'Bo Dietl',
-        title: 'Chairman, Strategic Advisory',
-        group: 'PPA+ Global Intelligence',
-        bio: 'Decorated former NYPD detective turned corporate intelligence executive, with a network spanning law enforcement, finance, and global corporate security.',
-    },
-    'Todd Zeile': {
-        name: 'Todd Zeile',
-        title: 'Managing Director',
-        group: 'PPA+ Capital Markets',
-        bio: 'Former MLB All-Star with post-retirement career in financial services, known for building high-trust relationships in alternative investments.',
-    },
-};
-
 const GEMINI_REST_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
 
 // ---------------------------------------------------------------------------
 // Fallback template — used when Gemini call fails
 // ---------------------------------------------------------------------------
 
 function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
+    const name = (input.lead.executiveName && input.lead.executiveName !== 'Unknown')
+        ? input.lead.executiveName.split(' ')[0]
+        : '';
+    const greeting = name ? `${name},` : 'Good morning,';
+
     const body = [
-        `${input.lead.executiveName},`,
+        greeting,
         '',
-        `Congratulations on the recent development — ${input.triggerHeadline.toLowerCase()}. The strategic implications are significant.`,
+        `I noticed ${input.lead.company}'s recent move — ${input.triggerHeadline}. This kind of transaction typically opens a window where the right advisory relationships make a material difference in how the integration plays out.`,
         '',
-        `I've been advising a number of institutional players navigating similar terrain, and there's a particular opportunity that could provide meaningful alpha for your organization.`,
+        `We've been working with firms navigating similar situations, particularly around the strategic and regulatory dimensions that tend to emerge in the months following a deal like this.`,
         '',
-        `Would 15 minutes this week make sense? I can walk through the specifics.`,
+        `Would it make sense to connect briefly this week? I'd be happy to share some perspective on what we're seeing in the market.`,
         '',
-        `Best regards,`,
+        `Best,`,
         signature,
     ].join('\n');
 
     return {
         personaUsed: input.persona,
-        subject: `${input.triggerHeadline.split(' ').slice(0, 4).join(' ')} — Strategic Access`,
+        subject: `${input.lead.company} — a thought on what comes next`,
         body,
         modelUsed: 'fallback-template',
         confidenceScore: 0.55,
@@ -80,43 +67,78 @@ function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
 // ---------------------------------------------------------------------------
 
 export async function generateDraft(env: Env, input: DraftInput): Promise<StrikeDraft> {
-    console.log(`✍️ Generating strike draft as ${input.persona} via Gemini 2.0 Flash...`);
+    // 1. Fetch Global System Settings
+    const { data: settings, ok, error } = await getRow(env, 'system_settings', 1);
 
-    const personaConfig =
-        PERSONA_SIGNATURES[input.persona] ?? PERSONA_SIGNATURES["Rob O'Neill"];
-    const signatureBlock = `${personaConfig.name}\n${personaConfig.title}\n${personaConfig.group}`;
+    if (!ok || !settings) {
+        console.error('❌ Failed to load system settings for draft generation', error);
+        throw new Error('System settings required for generation but failed to load.');
+    }
+
+    const {
+        company_name,
+        company_description,
+        default_sender_name,
+        default_sender_title,
+        default_sender_group
+    } = settings;
+
+    const signatureBlock = `${default_sender_name}\n${default_sender_title}\n${company_name} - ${default_sender_group}`;
+
+    console.log(`✍️ Generating strike draft as ${default_sender_name} via Gemini 3 Flash...`);
+
+    // Determine if we have a real contact name
+    const hasRealName = input.lead.executiveName
+        && input.lead.executiveName !== 'Unknown'
+        && !input.lead.executiveName.toLowerCase().includes('decision-maker');
 
     // Build the system prompt
-    const systemPrompt = `You are ${personaConfig.name}, ${personaConfig.title} at ${personaConfig.group}.
+    const systemPrompt = `You are ${default_sender_name}, ${default_sender_title} at ${company_name}.
 
-BACKGROUND: ${personaConfig.bio}
+ABOUT YOUR FIRM:
+${company_description || `${company_name} is a consulting and advisory firm specializing in strategic counsel for institutional clients navigating complex transactions, regulatory environments, and market transitions.`}
+${input.partnerProfile ? `
+CRITICAL STRATEGIC ALIGNMENT:
+This outreach is part of a specialized campaign on behalf of our key partner: ${input.partnerProfile.name}.
+Partner Value Proposition: ${input.partnerProfile.value_proposition}
+When crafting this outreach, you MUST naturally weave in how ${input.partnerProfile.name} can specifically help this executive address the challenges or opportunities created by this trigger event. Frame ${company_name} as the strategic advisor bringing this elite capability to the table.` : ''}
 
-YOUR VOICE:
-- Authoritative, direct, and warm. Never salesy.
-- Reference real context (the trigger event, the company, the executive's role).
-- Maximum 4 short paragraphs. No bullet points. No HTML.
-- Close with a soft one-question CTA asking for 15 minutes.
-- Always end with your literal signature block:
+WRITING STYLE RULES — THIS IS CRITICAL:
+1. Write like a thoughtful, experienced professional sending a brief personal note. NOT like a marketing email. NOT like a cold sales pitch. Think: a senior partner reaching out after reading about a deal in the morning paper.
+2. NEVER start with "Congratulations." NEVER use phrases like "strategic implications are significant" or "meaningful alpha" or "navigating similar terrain" — these scream AI-generated.
+3. Open with a SPECIFIC, intelligent observation about the deal/event. Reference actual details from the article — dollar amounts, counterparties, market context, what makes this deal interesting. Show you actually read and understood the news.
+4. In the second paragraph, draw a genuine connection to your firm's expertise. Be concrete about HOW you could help — not vague platitudes about "opportunities." For example: "We recently helped a mid-cap bank work through the regulatory sequencing after a similar acquisition" is much better than "We advise firms in similar situations."
+5. Keep the closing casual and low-pressure. Something like "Happy to share a few thoughts if useful" or "Worth a quick call?" — NOT "Would 15 minutes this week make sense?"
+6. Tone: Confident but human. Knowledgeable but not lecturing. Warm but brief. You should sound like someone the reader would actually want to get coffee with.
+7. Maximum 3-4 SHORT paragraphs. No bullet points. No HTML. No bold text. No emojis.
+8. ${hasRealName ? `Address them by first name: "${input.lead.executiveName.split(' ')[0]},"` : 'DO NOT say "Unknown." Start with a warm professional opening like "Good morning," or simply begin with your observation directly.'}
+9. End with ONLY this signature block:
+Best,
 ${signatureBlock}
 
 OUTPUT FORMAT:
 Respond with a JSON object ONLY (no markdown, no extra text):
 {
-  "subject": "<compelling 8–12 word subject line referencing the trigger>",
-  "body": "<full email body including salutation and signature>"
+  "subject": "<concise 6-10 word subject line that sounds human — reference the company or deal specifically>",
+  "body": "<full email body including greeting and signature>"
 }`;
 
     const userPrompt = `TRIGGER EVENT: ${input.triggerHeadline}
 
-PROSPECT PROFILE:
-- Name: ${input.lead.executiveName}
-- Title: ${input.lead.executiveTitle}
-- Company: ${input.lead.company}
-- Company Revenue / AUM: ${input.lead.companyRevenue}
-- Team Size: ${input.lead.employeeCount} employees
-- Recent Signals: ${input.lead.signals.join('; ')}
+ARTICLE CONTEXT (use specific details from this to make the email feel researched and personal):
+${input.triggerArticleText || 'No article text available — use the trigger headline and what you know about the deal type to craft an intelligent email.'}
 
-Write the personalized cold outreach email now.`;
+PROSPECT:
+- Name: ${hasRealName ? input.lead.executiveName : 'Not yet identified — use a warm greeting without a name'}
+- Title: ${input.lead.executiveTitle !== 'Unknown' ? input.lead.executiveTitle : 'Senior leadership'}
+- Company: ${input.lead.company}
+- Est. Revenue / AUM: ${input.lead.companyRevenue || 'Not available'}
+- Team Size: ${input.lead.employeeCount || 'Not available'}
+- Market Signals: ${input.lead.signals?.length ? input.lead.signals.join('; ') : 'Recent M&A activity'}
+
+${input.lead.executiveResearch ? `EXECUTIVE BACKGROUND:\n${input.lead.executiveResearch}` : ''}
+
+Write the outreach email. Sound human. Reference specific deal details. Be brief.`;
 
     try {
         const response = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
@@ -133,7 +155,7 @@ Write the personalized cold outreach email now.`;
                     },
                 ],
                 generationConfig: {
-                    temperature: 0.7,
+                    temperature: 0.85,
                     maxOutputTokens: 1024,
                     responseMimeType: 'application/json',
                 },
@@ -152,7 +174,9 @@ Write the personalized cold outreach email now.`;
             }>;
         };
 
-        const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+        // Gemini 3 may return multiple parts (text + thoughtSignature). Find the text part.
+        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+        const rawText = parts.find((p: any) => p.text)?.text;
         if (!rawText) {
             throw new Error('Gemini returned an empty response');
         }
@@ -165,11 +189,10 @@ Write the personalized cold outreach email now.`;
         }
 
         const draft: StrikeDraft = {
-            personaUsed: input.persona,
+            personaUsed: default_sender_name,
             subject: parsed.subject,
             body: parsed.body,
-            modelUsed: 'gemini-2.0-flash',
-            // Gemini doesn't return logprobs; use a fixed high-confidence value
+            modelUsed: 'gemini-3-flash-preview',
             confidenceScore: 0.91,
         };
 
