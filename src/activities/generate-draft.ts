@@ -42,11 +42,11 @@ function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
     const body = [
         greeting,
         '',
-        `I noticed ${input.lead.company}'s recent move — ${input.triggerHeadline}. This kind of transaction typically opens a window where the right advisory relationships make a material difference in how the integration plays out.`,
+        `Congratulations on the news — ${input.triggerHeadline}. This kind of transition opens a rare window where the right partnerships and advisory relationships can make a material difference in setting the trajectory for the organization.`,
         '',
-        `We've been working with firms navigating similar situations, particularly around the strategic and regulatory dimensions that tend to emerge in the months following a deal like this.`,
+        `We've been working closely with leaders navigating similar transitions, specifically by leveraging our training initiatives and bridging partnership opportunities that align seamlessly with new leadership mandates.`,
         '',
-        `Would it make sense to connect briefly this week? I'd be happy to share some perspective on what we're seeing in the market.`,
+        `Would it make sense to connect briefly this week? I'd love to explore how we can bridge some strategic connections that might benefit your team from day one.`,
         '',
         `Best,`,
         signature,
@@ -54,7 +54,7 @@ function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
 
     return {
         personaUsed: input.persona,
-        subject: `${input.lead.company} — a thought on what comes next`,
+        subject: `${input.lead.company} — a thought on your new role`,
         body,
         modelUsed: 'fallback-template',
         confidenceScore: 0.55,
@@ -66,21 +66,23 @@ function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
 // ---------------------------------------------------------------------------
 
 export async function generateDraft(env: Env, input: DraftInput): Promise<StrikeDraft> {
-    // 1. Fetch Global System Settings
-    const { data: settings, ok, error } = await getRow(env, 'system_settings', 1);
-
-    if (!ok || !settings) {
-        console.error('❌ Failed to load system settings for draft generation', error);
-        throw new Error('System settings required for generation but failed to load.');
+    // 1. Fetch Global System Settings (with fallback defaults)
+    let settings: any = null;
+    try {
+        const result = await getRow(env, 'system_settings', 1);
+        if (result.ok && result.data) {
+            settings = result.data;
+        }
+    } catch (settingsErr) {
+        console.warn('⚠️ System settings fetch failed, using defaults:', settingsErr);
     }
 
-    const {
-        company_name,
-        company_description,
-        default_sender_name,
-        default_sender_title,
-        default_sender_group
-    } = settings;
+    // Use settings or sensible defaults
+    const company_name = settings?.company_name || 'Polsinelli Public Affairs, LLC';
+    const company_description = settings?.company_description || '';
+    const default_sender_name = settings?.default_sender_name || 'Fred Polsinelli';
+    const default_sender_title = settings?.default_sender_title || 'CEO';
+    const default_sender_group = settings?.default_sender_group || 'Consulting Agency';
 
     const signatureBlock = `${default_sender_name}\n${default_sender_title}\n${company_name} - ${default_sender_group}`;
 
@@ -98,23 +100,26 @@ ABOUT YOUR FIRM:
 ${company_description || `${company_name} is a consulting and advisory firm specializing in strategic counsel for institutional clients navigating complex transactions, regulatory environments, and market transitions.`}
 ${input.partnerProfiles && input.partnerProfiles.length > 0 ? `
 PARTNER SYNDICATE ALIGNMENT:
-You are operating as a Strategic Syndicate Director. This outreach is part of a multi-partner campaign. Evaluate the strengths of each partner below against the target's trigger event and weave the MOST RELEVANT partner capability into the email naturally. You do NOT need to mention every partner — focus on the 1-2 most strategic alignments.
+You are operating as a Strategic Syndicate Director. This outreach is part of a multi-partner campaign. Evaluate the strengths of each partner below against the target's trigger event and weave the MOST RELEVANT partner capability into the email naturally to bridge connections. You do NOT need to mention every partner — focus on the 1-2 most strategic alignments that could genuinely benefit their organization.
 
 ${input.partnerProfiles.map((p: any, i: number) => `Partner ${i + 1}: ${p.name}
 Positioning: ${p.partner_positioning || p.ai_summary || p.value_proposition || 'Strategic partner'}
+${p.ideal_customer_profile ? `Ideal Customer Profile: ${p.ideal_customer_profile}` : ''}
+${p.ai_alignment_rules ? `Strict Alignment Rules: ${p.ai_alignment_rules}` : ''}
 ${p.domain ? `Domain: ${p.domain}` : ''}`).join('\n\n')}
 
 Frame ${company_name} as the strategic advisor orchestrating this syndicate of elite capabilities for the prospect.` : ''}
 
 WRITING STYLE RULES — THIS IS CRITICAL:
-1. Write like a thoughtful, experienced professional sending a brief personal note. NOT like a marketing email. NOT like a cold sales pitch. Think: a senior partner reaching out after reading about a deal in the morning paper.
-2. NEVER start with "Congratulations." NEVER use phrases like "strategic implications are significant" or "meaningful alpha" or "navigating similar terrain" — these scream AI-generated.
+1. Write like a thoughtful, experienced professional sending a brief, warm, highly personal note. Speak DIRECTLY to the recipient in the first person (i.e. "I saw your recent appointment" instead of "I saw Michelle was appointed"). Do NOT refer to the recipient in the third person if the article is about them.
+2. If the trigger event is about their new role or appointment, congratulate them personally on the position as your opening hook. Make it engaging, human, and genuine.
 3. Open with a SPECIFIC, intelligent observation about the deal/event. Reference actual details from the article — dollar amounts, counterparties, market context, what makes this deal interesting. Show you actually read and understood the news.
-4. In the second paragraph, draw a genuine connection to your firm's expertise. Be concrete about HOW you could help — not vague platitudes about "opportunities." For example: "We recently helped a mid-cap bank work through the regulatory sequencing after a similar acquisition" is much better than "We advise firms in similar situations."
-5. Keep the closing casual and low-pressure. Something like "Happy to share a few thoughts if useful" or "Worth a quick call?" — NOT "Would 15 minutes this week make sense?"
-6. Tone: Confident but human. Knowledgeable but not lecturing. Warm but brief. You should sound like someone the reader would actually want to get coffee with.
-7. Maximum 3-4 SHORT paragraphs. No bullet points. No HTML. No bold text. No emojis.
-8. ${hasRealName ? `Address them by first name: "${input.lead.executiveName.split(' ')[0]},"` : 'DO NOT say "Unknown." Start with a warm professional opening like "Good morning," or simply begin with your observation directly.'}
+4. In the second paragraph, draw a genuine connection showing how our training initiatives, employee benefits, or strategic partnership capabilities can support their new mandate and benefit their organization.
+5. If they were recently appointed, review the PARTNER SYNDICATE ALIGNMENT (if provided) to actively bridge connections and suggest specific partnership opportunities that align with their agenda.
+6. Keep the closing casual and low-pressure. Something like "Happy to share a few thoughts if useful" or "Worth a quick call?" — NOT "Would 15 minutes this week make sense?"
+7. Tone: Confident but human. Knowledgeable but not lecturing. Warm but brief. You should sound like someone the reader would actually want to get coffee with. NEVER sound like an automated system.
+8. Maximum 3-4 SHORT paragraphs. No bullet points. No HTML. No bold text. No emojis.
+9. ${hasRealName ? `Address them by first name: "${input.lead.executiveName.split(' ')[0]},"` : 'DO NOT say "Unknown." Start with a warm professional opening like "Good morning," or simply begin with your observation directly.'}
 9. End with ONLY this signature block:
 Best,
 ${signatureBlock}

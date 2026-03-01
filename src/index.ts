@@ -858,6 +858,41 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             return Response.json({ status: 'accepted' });
         }
 
+        // ── Temporary Diagnostic: Test Gemini API ──────────────────────
+        if (url.pathname === '/api/test-gemini' && request.method === 'GET') {
+            try {
+                const apiKey = env.GEMINI_API_KEY;
+                if (!apiKey) return jsonWithCors({ error: 'GEMINI_API_KEY not set' });
+
+                const { GEMINI_REST_URL } = await import('./config/gemini');
+                const testUrl = `${GEMINI_REST_URL}?key=${apiKey}`;
+
+                const res = await fetch(testUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ role: 'user', parts: [{ text: 'Say hello in exactly 5 words.' }] }],
+                        generationConfig: { temperature: 0.5, maxOutputTokens: 50 },
+                    }),
+                });
+
+                if (!res.ok) {
+                    const errText = await res.text();
+                    return jsonWithCors({
+                        error: `Gemini ${res.status}`,
+                        detail: errText.slice(0, 500),
+                        url: testUrl.replace(apiKey, 'REDACTED'),
+                    });
+                }
+
+                const data = await res.json() as any;
+                const text = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text)?.text;
+                return jsonWithCors({ success: true, response: text, model: 'gemini-3-flash-preview' });
+            } catch (err) {
+                return jsonWithCors({ error: String(err) }, { status: 500 });
+            }
+        }
+
         return Response.json({ error: 'Not found' }, { status: 404 });
     },
 
@@ -905,22 +940,43 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     }
                     const lead = targetRows[0];
 
-                    // Always re-enrich the lead to get the latest data and real contact names
-                    const enrichedLead = await enrichLead(env, {
-                        company: lead.company,
-                        executiveName: lead.executive_name,
-                        executiveTitle: lead.executive_title,
-                        leadId: lead.id,
-                    });
+                    // Try to re-enrich but fall back to existing data if Apollo fails/times out
+                    let enrichedLead: any;
+                    try {
+                        enrichedLead = await enrichLead(env, {
+                            company: lead.company,
+                            executiveName: lead.executive_name,
+                            executiveTitle: lead.executive_title,
+                            leadId: lead.id,
+                        });
 
-                    // Update the lead_targets row with the fresh enrichment data
-                    if (enrichedLead.executiveName && enrichedLead.executiveName !== 'Key Decision-Maker') {
-                        const { patchRow: patchLead } = await import('./utils/supabase');
-                        await patchLead(env, 'lead_targets', {
-                            executive_name: enrichedLead.executiveName,
-                            executive_title: enrichedLead.executiveTitle,
-                        }, 'id', lead.id);
+                        // Update the lead_targets row with the fresh enrichment data
+                        if (enrichedLead.executiveName && enrichedLead.executiveName !== 'Key Decision-Maker') {
+                            const { patchRow: patchLead } = await import('./utils/supabase');
+                            await patchLead(env, 'lead_targets', {
+                                executive_name: enrichedLead.executiveName,
+                                executive_title: enrichedLead.executiveTitle,
+                            }, 'id', lead.id);
+                        }
+                    } catch (enrichErr) {
+                        console.warn('⚠️ Re-enrichment failed, using existing lead data:', enrichErr);
+                        // Fall back to existing lead data
+                        const existingEnrichment = lead.enrichment_data || {};
+                        enrichedLead = {
+                            company: lead.company,
+                            executiveName: lead.executive_name || 'Unknown',
+                            executiveTitle: lead.executive_title || 'Unknown',
+                            companyRevenue: existingEnrichment.revenue || null,
+                            employeeCount: existingEnrichment.employees || null,
+                            signals: existingEnrichment.signals || [],
+                            linkedinUrl: existingEnrichment.linkedin_url || null,
+                            email: existingEnrichment.email || '',
+                            executiveResearch: existingEnrichment.executive_research || '',
+                        };
                     }
+
+                    // Extract trigger article text from stored enrichment for better context
+                    const triggerArticleText = lead.enrichment_data?.trigger_summary || '';
 
                     // Fetch system settings for the sender persona
                     const { getRow } = await import('./utils/supabase');
@@ -947,6 +1003,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         lead: enrichedLead,
                         persona: senderName,
                         triggerHeadline: lead.trigger_event,
+                        triggerArticleText,
                         partnerProfiles,
                     });
 
