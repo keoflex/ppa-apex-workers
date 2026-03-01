@@ -858,38 +858,62 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             return Response.json({ status: 'accepted' });
         }
 
-        // ── Temporary Diagnostic: Test Gemini API ──────────────────────
-        if (url.pathname === '/api/test-gemini' && request.method === 'GET') {
+        // ── Temporary Diagnostic: Test full generateDraft pipeline ──────
+        if (url.pathname === '/api/test-draft' && request.method === 'POST') {
             try {
-                const apiKey = env.GEMINI_API_KEY;
-                if (!apiKey) return jsonWithCors({ error: 'GEMINI_API_KEY not set' });
+                const body = await request.json() as { workflowId?: string };
+                if (!body.workflowId) return jsonWithCors({ error: 'Missing workflowId' }, { status: 400 });
 
-                const { GEMINI_REST_URL } = await import('./config/gemini');
-                const testUrl = `${GEMINI_REST_URL}?key=${apiKey}`;
+                const { fetchRow } = await import('./utils/supabase');
 
-                const res = await fetch(testUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        contents: [{ role: 'user', parts: [{ text: 'Say hello in exactly 5 words.' }] }],
-                        generationConfig: { temperature: 0.5, maxOutputTokens: 50 },
-                    }),
+                // Fetch campaign
+                const campaignRows = await fetchRow(env, 'strike_campaigns', 'workflow_id', body.workflowId);
+                if (!campaignRows?.length) return jsonWithCors({ error: 'Campaign not found' });
+                const campaign = campaignRows[0];
+
+                // Fetch lead target
+                const targetRows = await fetchRow(env, 'lead_targets', 'id', campaign.target_id);
+                if (!targetRows?.length) return jsonWithCors({ error: 'Target not found' });
+                const lead = targetRows[0];
+
+                // Build enriched lead from existing data (skip Apollo)
+                const existingEnrichment = lead.enrichment_data || {};
+                const enrichedLead = {
+                    company: lead.company,
+                    executiveName: lead.executive_name || 'Unknown',
+                    executiveTitle: lead.executive_title || 'Unknown',
+                    companyDomain: existingEnrichment.company_domain || '',
+                    companyRevenue: existingEnrichment.revenue || null,
+                    employeeCount: existingEnrichment.employees || null,
+                    signals: existingEnrichment.signals || [],
+                    linkedinUrl: existingEnrichment.linkedin_url || null,
+                    email: existingEnrichment.email || '',
+                    executiveResearch: existingEnrichment.executive_research || '',
+                };
+
+                const triggerArticleText = existingEnrichment.trigger_summary || '';
+
+                // Run generateDraft
+                const { generateDraft } = await import('./activities/generate-draft');
+                const draft = await generateDraft(env, {
+                    lead: enrichedLead,
+                    persona: 'Fred Polsinelli',
+                    triggerHeadline: lead.trigger_event,
+                    triggerArticleText,
+                    partnerProfiles: [],
                 });
 
-                if (!res.ok) {
-                    const errText = await res.text();
-                    return jsonWithCors({
-                        error: `Gemini ${res.status}`,
-                        detail: errText.slice(0, 500),
-                        url: testUrl.replace(apiKey, 'REDACTED'),
-                    });
-                }
-
-                const data = await res.json() as any;
-                const text = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text)?.text;
-                return jsonWithCors({ success: true, response: text, model: 'gemini-3-flash-preview' });
+                return jsonWithCors({
+                    success: true,
+                    isFallback: draft.body.includes('This kind of transition opens a rare window'),
+                    fallbackReason: (draft as any).__fallbackReason || null,
+                    subject: draft.subject,
+                    bodyPreview: draft.body.slice(0, 300),
+                    modelUsed: draft.modelUsed,
+                    confidence: draft.confidenceScore,
+                });
             } catch (err) {
-                return jsonWithCors({ error: String(err) }, { status: 500 });
+                return jsonWithCors({ error: String(err), stack: (err as any)?.stack?.slice(0, 500) }, { status: 500 });
             }
         }
 

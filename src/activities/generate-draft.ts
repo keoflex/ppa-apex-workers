@@ -164,7 +164,7 @@ Write the outreach email. Sound human. Reference specific deal details. Be brief
                 ],
                 generationConfig: {
                     temperature: 0.85,
-                    maxOutputTokens: 1024,
+                    maxOutputTokens: 4096,
                     responseMimeType: 'application/json',
                 },
             }),
@@ -208,7 +208,33 @@ Write the outreach email. Sound human. Reference specific deal details. Be brief
         }
 
         // Parse the JSON payload from the model
-        const parsed = JSON.parse(cleanedText) as { subject?: string; body?: string };
+        // Gemini sometimes outputs JSON with literal newlines inside strings, which is invalid.
+        // Fix: escape unescaped newlines within JSON string values before parsing.
+        let parsed: { subject?: string; body?: string };
+        try {
+            parsed = JSON.parse(cleanedText);
+        } catch {
+            // Attempt to fix common JSON issues: literal newlines in string values
+            const fixedText = cleanedText
+                .replace(/\r\n/g, '\\n')
+                .replace(/\n/g, '\\n')
+                .replace(/\t/g, '\\t');
+            try {
+                parsed = JSON.parse(fixedText);
+            } catch {
+                // Last resort: regex extract subject and body
+                const subjectMatch = cleanedText.match(/"subject"\s*:\s*"([^"]+)"/);
+                const bodyMatch = cleanedText.match(/"body"\s*:\s*"([\s\S]+?)"\s*[,}]/);
+                if (subjectMatch && bodyMatch) {
+                    parsed = {
+                        subject: subjectMatch[1],
+                        body: bodyMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+                    };
+                } else {
+                    throw new Error(`Failed to parse Gemini JSON even with fallbacks. Raw (first 300 chars): ${cleanedText.slice(0, 300)}`);
+                }
+            }
+        }
 
         if (!parsed.subject || !parsed.body) {
             throw new Error(`Gemini response missing subject or body fields. Got: ${cleanedText.slice(0, 200)}`);
@@ -226,6 +252,10 @@ Write the outreach email. Sound human. Reference specific deal details. Be brief
         return draft;
     } catch (err) {
         console.error('❌ Gemini draft generation failed, using fallback template:', err);
-        return buildFallbackDraft(input, signatureBlock);
+        // Store last error for diagnostics
+        (generateDraft as any).__lastError = String(err);
+        const fallback = buildFallbackDraft(input, signatureBlock);
+        (fallback as any).__fallbackReason = String(err);
+        return fallback;
     }
 }
