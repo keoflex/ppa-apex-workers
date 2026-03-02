@@ -13,6 +13,8 @@
         "wrangler": "^4.0.0"
     },
     "dependencies": {
-        "@supabase/supabase-js": "^2.49.0"
+        "@google/genai": "^1.43.0",
+        "@supabase/supabase-js": "^2.49.0",
+        "exa-js": "^2.6.1"
     }
 }

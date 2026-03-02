@@ -7,10 +7,15 @@
  * 3. Durable Object exports (HITL gate)
  */
 import { HitlGateDurableObject } from './durable-objects/hitl-gate';
-import { senseTriggers, senseTriggersForAgent } from './activities/sense-triggers';
+import { senseTriggers, senseTriggersForAgent, type MarketTrigger } from './activities/sense-triggers';
+import { senseSecFilings, senseSecFilingsForQuery } from './activities/sense-sec-filings';
+import { senseCourtFilings, senseCourtFilingsForQuery } from './activities/sense-court-filings';
+import { senseNews, senseNewsForQuery } from './activities/sense-news';
+import { deduplicateTriggers } from './utils/dedup';
 import { enrichLead, type EnrichedLead } from './activities/enrich-lead';
 import type { DraftInput } from './activities/generate-draft';
 import { generateDraft } from './activities/generate-draft';
+import { generateTerritoryBriefings } from './tasks/generate-briefing';
 import { geminiUrl, GEMINI_REST_URL } from './config/gemini';
 import { executeCampaign } from './activities/execute-campaign';
 import { triageReply } from './activities/triage-reply';
@@ -30,6 +35,8 @@ export interface Env {
     SMARTLEAD_API_KEY: string;
     WORKER_SECRET: string;
     ENVIRONMENT: string;
+    COURTLISTENER_API_KEY?: string;
+    NEWSDATA_API_KEY?: string;
 }
 
 export default {
@@ -732,6 +739,40 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             }
         }
 
+        // Search Mission — run a one-off targeted search query through the pipeline
+        if (url.pathname === '/api/search-mission' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    query: string;
+                    persona?: string;
+                    maxResults?: number;
+                    runId?: string;
+                };
+
+                if (!body.query || body.query.trim().length < 5) {
+                    return jsonWithCors({ error: 'Search query too short (min 5 characters)' }, { status: 400 });
+                }
+
+                console.log(`🎯 Search mission received: "${body.query}"`);
+
+                if (env.STRIKE_QUEUE) {
+                    await env.STRIKE_QUEUE.send({
+                        campaignId: 0,
+                        persona: body.persona || "Rob O'Neill",
+                        action: 'search_mission',
+                        searchQuery: body.query,
+                        maxResults: body.maxResults || 5,
+                        runId: body.runId || null,
+                    });
+                    return jsonWithCors({ status: 'queued', query: body.query }, { status: 202 });
+                }
+
+                return jsonWithCors({ error: 'Queue not available' }, { status: 503 });
+            } catch (error) {
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // Re-enrich a lead target (Research Further)
         if (url.pathname === '/api/re-enrich' && request.method === 'POST') {
             try {
@@ -1193,6 +1234,55 @@ Return ONLY a JSON object:
                         msg.ack();
                         continue;
                     }
+                } else if (action === 'search_mission' && msg.body.searchQuery) {
+                    // Search Mission: fan out to ALL 4 sources in parallel
+                    console.log(`🎯 Processing search mission: "${msg.body.searchQuery}"`);
+                    const searchQuery = msg.body.searchQuery;
+                    const virtualAgent = {
+                        id: 0,
+                        name: 'Search Mission',
+                        exa_query: searchQuery,
+                        max_leads_per_run: msg.body.maxResults || 5,
+                    };
+
+                    // Fan out to all sources in parallel
+                    const [exaResult, secResult, courtResult, newsResult] = await Promise.allSettled([
+                        senseTriggersForAgent(env, virtualAgent),
+                        senseSecFilingsForQuery(env, searchQuery),
+                        senseCourtFilingsForQuery(env, searchQuery),
+                        senseNewsForQuery(env, searchQuery),
+                    ]);
+
+                    // Merge all successful results
+                    const allTriggers: MarketTrigger[] = [];
+                    for (const result of [exaResult, secResult, courtResult, newsResult]) {
+                        if (result.status === 'fulfilled') allTriggers.push(...result.value);
+                    }
+
+                    // Deduplicate across sources
+                    triggers = deduplicateTriggers(allTriggers);
+                    console.log(`📡 Mission found ${allTriggers.length} raw → ${triggers.length} unique triggers across all sources`);
+
+                    if (triggers.length === 0) {
+                        console.log(`⚠️ No triggers found for search mission`);
+                        if (msg.body.runId) {
+                            await patchRow(env, 'pipeline_runs', {
+                                status: 'completed',
+                                triggers_found: 0,
+                                leads_enriched: 0,
+                                drafts_generated: 0,
+                                completed_at: new Date().toISOString(),
+                                metadata: { query: searchQuery, result: 'no_triggers', sources_checked: 4 },
+                            }, 'id', msg.body.runId);
+                        }
+                        msg.ack();
+                        continue;
+                    }
+                } else if (action === 'process_external_trigger' && msg.body.trigger) {
+                    // External trigger from additional sources (SEC, Court, News)
+                    const t = msg.body.trigger as MarketTrigger;
+                    console.log(`📡 Processing external trigger: ${t.company} (${t.source})`);
+                    triggers = [t];
                 } else {
                     // Step 1: Sense market triggers (Global fallback if no agent specified)
                     triggers = await senseTriggers(env);
@@ -1231,14 +1321,40 @@ Return ONLY a JSON object:
                             executiveTitle: selectedTrigger.executiveTitle,
                         });
 
+                        // Step 2.5: Compliance & Suppression Check
+                        let isSuppressed = false;
+                        let suppressionReason = '';
+                        if (enrichedLead.email || enrichedLead.companyDomain) {
+                            const { fetchRow } = await import('./utils/supabase');
+
+                            if (enrichedLead.email) {
+                                const emailMatches = await fetchRow(env, 'suppression_list', 'email', enrichedLead.email);
+                                if (emailMatches && emailMatches.length > 0) {
+                                    isSuppressed = true;
+                                    suppressionReason = emailMatches[0].reason;
+                                }
+                            }
+
+                            if (!isSuppressed && enrichedLead.companyDomain) {
+                                const domainMatches = await fetchRow(env, 'suppression_list', 'domain', enrichedLead.companyDomain);
+                                if (domainMatches && domainMatches.length > 0) {
+                                    isSuppressed = true;
+                                    suppressionReason = domainMatches[0].reason;
+                                }
+                            }
+                        }
+
                         // Step 3: Generate personalized email draft via Gemini
-                        const draft = await generateDraft(env, {
-                            lead: enrichedLead,
-                            persona: persona || "Rob O'Neill",
-                            triggerHeadline: selectedTrigger.headline,
-                            triggerArticleText: selectedTrigger.articleText || '',
-                            partnerProfiles,
-                        });
+                        let draft = { subject: 'Suppressed Contact', body: `This contact was flagged against the suppression list. Reason: ${suppressionReason || 'Unknown'}` };
+                        if (!isSuppressed) {
+                            draft = await generateDraft(env, {
+                                lead: enrichedLead,
+                                persona: persona || "Rob O'Neill",
+                                triggerHeadline: selectedTrigger.headline,
+                                triggerArticleText: selectedTrigger.articleText || '',
+                                partnerProfiles,
+                            });
+                        }
 
                         // Step 4: Save lead + campaign to Supabase
                         const workflowId = `wf-${crypto.randomUUID().slice(0, 12)}`;
@@ -1251,6 +1367,7 @@ Return ONLY a JSON object:
                             trigger_source: selectedTrigger.sourceUrl || null,
                             trigger_relevance: selectedTrigger.relevanceScore || 95,
                             enrichment_data: {
+                                data_source: selectedTrigger.source || 'Exa.ai',
                                 revenue: enrichedLead.companyRevenue,
                                 employees: enrichedLead.employeeCount,
                                 signals: enrichedLead.signals,
@@ -1265,6 +1382,14 @@ Return ONLY a JSON object:
                                 ],
                                 source: 'gemini+apollo+exa',
                                 enriched_at: new Date().toISOString(),
+                                // Mission alignment metadata (set when strike comes from a search mission)
+                                ...(msg.body.missionId ? {
+                                    mission_aligned: true,
+                                    mission_id: msg.body.missionId,
+                                    mission_name: msg.body.missionName || 'Search Mission',
+                                    territory_id: msg.body.territoryId || null,
+                                    territory_name: msg.body.territoryName || null,
+                                } : {}),
                             },
                         });
 
@@ -1272,7 +1397,7 @@ Return ONLY a JSON object:
                             const targetId = targetRes.data[0].id;
                             const campaignRes = await insertRow(env, 'strike_campaigns', {
                                 target_id: targetId,
-                                status: 'pending_hitl',
+                                status: isSuppressed ? 'suppressed' : 'pending_hitl',
                                 persona_used: persona,
                                 email_subject: draft.subject,
                                 drafted_body: draft.body,
@@ -1280,8 +1405,8 @@ Return ONLY a JSON object:
                                 campaign_id: strategicCampaignId,
                             });
 
-                            // Initialize HITL Gate
-                            if (campaignRes.ok && campaignRes.data?.[0]?.id) {
+                            // Initialize HITL Gate only if not suppressed
+                            if (!isSuppressed && campaignRes.ok && campaignRes.data?.[0]?.id) {
                                 try {
                                     const gateId = env.HITL_GATE.idFromName(workflowId);
                                     const gate = env.HITL_GATE.get(gateId);
@@ -1331,6 +1456,39 @@ Return ONLY a JSON object:
 
                 console.log(`✅ Pipeline complete: ${newTriggers.length} triggers processed`);
 
+                // Update pipeline_runs record if this was a search mission
+                if (action === 'search_mission' && msg.body.runId) {
+                    try {
+                        await patchRow(env, 'pipeline_runs', {
+                            status: 'completed',
+                            triggers_found: triggers.length,
+                            leads_enriched: newTriggers.length,
+                            drafts_generated: newTriggers.length,
+                            completed_at: new Date().toISOString(),
+                            metadata: {
+                                ...(msg.body.missionId ? {
+                                    mission_id: msg.body.missionId,
+                                    mission_name: msg.body.missionName,
+                                    territory_id: msg.body.territoryId,
+                                    territory_name: msg.body.territoryName,
+                                } : {}),
+                                query: msg.body.searchQuery,
+                                triggers_total: triggers.length,
+                                triggers_new: newTriggers.length,
+                                triggers_deduplicated: triggers.length - newTriggers.length,
+                                sources_checked: 4,
+                            },
+                        }, 'id', msg.body.runId);
+
+                        // Also update saved_searches results_count
+                        if (msg.body.missionId) {
+                            await patchRow(env, 'saved_searches', {
+                                results_count: newTriggers.length,
+                            }, 'id', msg.body.missionId);
+                        }
+                    } catch (_) { /* non-blocking */ }
+                }
+
                 msg.ack();
             } catch (error) {
                 console.error(`❌ Queue processing error for Campaign #${msg.body.campaignId || 0}:`, error);
@@ -1341,13 +1499,16 @@ Return ONLY a JSON object:
 
     /**
      * Scheduled handler — cron-triggered market sensing.
-     * Runs at 9 AM EST (14:00 UTC) Mon-Fri.
+     * Runs at 9 AM + 3 PM EST Mon-Fri.
      */
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
         console.log(`⏰ Cron triggered: ${new Date(event.scheduledTime).toISOString()}`);
 
         try {
-            // Fetch all active agents that have a schedule != 'manual'
+            // 1. Run territory briefings generator first
+            await generateTerritoryBriefings(env);
+
+            // 2. Fetch all active agents that have a schedule != 'manual'
             const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=*`;
             const res = await fetch(url, {
                 method: 'GET',
@@ -1378,9 +1539,161 @@ Return ONLY a JSON object:
                 }
             }
 
-            console.log(`✅ Cron complete: ${agents.length} agents dispatched`);
+            // 3. Run additional free sources in parallel (non-blocking)
+            ctx.waitUntil(runAdditionalSources(env));
+
+            // 4. Auto-run saved search missions (frequency = 'daily')
+            ctx.waitUntil(runSavedSearchMissions(env));
+
+            console.log(`✅ Cron complete: ${agents.length} agents dispatched + additional sources + missions launched`);
         } catch (error) {
             console.error('❌ Cron error:', error);
         }
     },
 };
+
+// ---------------------------------------------------------------------------
+// Additional free sources — runs in parallel during cron, non-blocking
+// ---------------------------------------------------------------------------
+
+async function runAdditionalSources(env: Env): Promise<void> {
+    try {
+        console.log('📡 Running additional free data sources (SEC, Court, News)...');
+
+        const [secResult, courtResult, newsResult] = await Promise.allSettled([
+            senseSecFilings(env),
+            senseCourtFilings(env),
+            senseNews(env),
+        ]);
+
+        const allTriggers: MarketTrigger[] = [];
+        const sourceStats: Record<string, number> = {};
+
+        for (const [label, result] of [
+            ['SEC EDGAR', secResult],
+            ['CourtListener', courtResult],
+            ['NewsData.io', newsResult],
+        ] as [string, PromiseSettledResult<MarketTrigger[]>][]) {
+            if (result.status === 'fulfilled') {
+                allTriggers.push(...result.value);
+                sourceStats[label] = result.value.length;
+            } else {
+                sourceStats[label] = 0;
+                console.warn(`⚠️ ${label} failed:`, result.reason);
+            }
+        }
+
+        if (allTriggers.length === 0) {
+            console.log('📡 No triggers from additional sources.');
+            return;
+        }
+
+        // Deduplicate across sources
+        const unique = deduplicateTriggers(allTriggers);
+        console.log(`📡 Additional sources: ${allTriggers.length} raw → ${unique.length} unique (SEC: ${sourceStats['SEC EDGAR']}, Court: ${sourceStats['CourtListener']}, News: ${sourceStats['NewsData.io']})`);
+
+        // Queue each trigger for processing through the standard pipeline
+        // Limit to top 10 to avoid overwhelming the queue
+        for (const trigger of unique.slice(0, 10)) {
+            if (env.STRIKE_QUEUE) {
+                await env.STRIKE_QUEUE.send({
+                    campaignId: 0,
+                    persona: "Rob O'Neill",
+                    action: 'process_external_trigger',
+                    trigger,
+                });
+            }
+        }
+
+        console.log(`✅ Queued ${Math.min(unique.length, 10)} triggers from additional sources`);
+    } catch (err) {
+        console.error('❌ Additional sources error:', err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-run saved search missions — dispatches all daily-frequency missions
+// ---------------------------------------------------------------------------
+
+async function runSavedSearchMissions(env: Env): Promise<void> {
+    try {
+        console.log('🎯 Checking for saved search missions to auto-run...');
+
+        // Fetch all saved searches with frequency = 'daily' + their territory info
+        const ssUrl = `${env.SUPABASE_URL}/rest/v1/saved_searches?frequency=eq.daily&select=*,territories(id,name)`;
+        const ssRes = await fetch(ssUrl, {
+            headers: {
+                'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                'Accept': 'application/json',
+            },
+        });
+
+        if (!ssRes.ok) {
+            console.warn(`⚠️ Failed to fetch saved searches: ${ssRes.status}`);
+            return;
+        }
+
+        const searches = await ssRes.json() as any[];
+        if (!searches || searches.length === 0) {
+            console.log('🎯 No daily search missions configured.');
+            return;
+        }
+
+        console.log(`🎯 Found ${searches.length} daily search missions to dispatch`);
+
+        for (const search of searches) {
+            try {
+                const territoryName = search.territories?.name || 'Unknown Territory';
+
+                // Create a pipeline_runs record for this mission
+                const { insertRow, patchRow } = await import('./utils/supabase');
+                const runRes = await insertRow(env, 'pipeline_runs', {
+                    run_type: 'search_mission',
+                    agent_name: `Mission: ${search.name}`,
+                    status: 'running',
+                    triggered_by: 'cron',
+                    metadata: {
+                        mission_id: search.id,
+                        mission_name: search.name,
+                        territory_id: search.territory_id,
+                        territory_name: territoryName,
+                        query: search.exa_query,
+                    },
+                    started_at: new Date().toISOString(),
+                });
+
+                const runId = runRes.data?.[0]?.id;
+
+                // Dispatch the mission to the queue with metadata
+                if (env.STRIKE_QUEUE) {
+                    await env.STRIKE_QUEUE.send({
+                        campaignId: 0,
+                        persona: "Rob O'Neill",
+                        action: 'search_mission',
+                        searchQuery: search.exa_query,
+                        maxResults: 5,
+                        runId,
+                        // Mission metadata — carried through to strikes
+                        missionId: search.id,
+                        missionName: search.name,
+                        territoryId: search.territory_id,
+                        territoryName: territoryName,
+                    });
+                    console.log(`📤 Dispatched mission: "${search.name}" (territory: ${territoryName})`);
+                }
+
+                // Update last_run_at
+                await patchRow(env, 'saved_searches', {
+                    last_run_at: new Date().toISOString(),
+                }, 'id', search.id);
+            } catch (missionErr) {
+                console.warn(`⚠️ Failed to dispatch mission "${search.name}":`, missionErr);
+            }
+        }
+
+        console.log(`✅ Dispatched ${searches.length} search missions`);
+    } catch (err) {
+        console.error('❌ Saved search missions error:', err);
+    }
+}

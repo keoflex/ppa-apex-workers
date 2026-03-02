@@ -40,6 +40,6 @@ max_batch_size = 10
 max_batch_timeout = 30
 
 # ── Cron Triggers ──
-# 9 AM EST (14:00 UTC) Mon-Fri — market sensing
+# 9 AM EST (14:00 UTC) + 3 PM EST (20:00 UTC) Mon-Fri — market sensing
 [triggers]
-crons = ["0 14 * * 1-5"]
+crons = ["0 14 * * 1-5", "0 20 * * 1-5"]

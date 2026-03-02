@@ -12,6 +12,12 @@ export interface DraftInput {
     triggerHeadline: string;
     triggerArticleText?: string;
     partnerProfiles?: any[];  // M:N — array of partner companies
+    stepContext?: {
+        stepNumber: number;
+        totalSteps: number;
+        stepPrompt: string;
+        previousEmails: string[];
+    };
 }
 
 export interface StrikeDraft {
@@ -146,7 +152,15 @@ PROSPECT:
 
 ${input.lead.executiveResearch ? `EXECUTIVE BACKGROUND:\n${input.lead.executiveResearch}` : ''}
 
-Write the outreach email. Sound human. Reference specific deal details. Be brief.`;
+${input.stepContext ? `SEQUENCE CONTEXT (THIS IS A FOLLOW-UP EMAIL):
+This is step ${input.stepContext.stepNumber} of ${input.stepContext.totalSteps} in a sequence.
+PREVIOUS EMAILS SENT:
+${input.stepContext.previousEmails.map((e, i) => `--- Email ${i + 1} ---\n${e}`).join('\n\n')}
+
+YOUR INSTRUCTION FOR THIS SPECIFIC STEP:
+${input.stepContext.stepPrompt}` : ''}
+
+Write the outreach email. Sound human. Reference specific deal details. Be brief. ${input.stepContext ? 'Ensure it reads naturally as a follow-up to the previous emails, referencing them lightly if appropriate, but primarily focusing on the specific step instruction.' : ''}`;
 
     try {
         const response = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {

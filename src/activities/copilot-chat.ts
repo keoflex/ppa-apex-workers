@@ -20,9 +20,16 @@ export interface CopilotMessage {
     toolUsed?: string;
 }
 
+export interface PageContext {
+    type: 'strike' | 'campaign' | 'contact';
+    entityId?: string | number;
+    data: Record<string, any>;
+}
+
 export interface CopilotRequest {
     message: string;
     history: CopilotMessage[];
+    pageContext?: PageContext;
 }
 
 export interface CopilotResponse {
@@ -88,6 +95,50 @@ const TOOL_DECLARATIONS = [
                 },
             },
             required: ['target_company'],
+        },
+    },
+    {
+        name: 'research_entity',
+        description: 'Search the web (via Exa) for additional intelligence about a company, executive, or topic. Use this when the user wants to learn more, asks for research, or says "tell me more about..." or "research this company." Returns web search results with key findings.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                query: {
+                    type: 'STRING',
+                    description: 'Search query — e.g. the company name, executive name, or topic to research',
+                },
+                entity_type: {
+                    type: 'STRING',
+                    description: 'Type of entity: "company", "person", or "topic"',
+                },
+            },
+            required: ['query'],
+        },
+    },
+    {
+        name: 'save_intelligence',
+        description: 'Save newly discovered intelligence back to the knowledge base. Use this when the user explicitly wants to add research findings to the system — e.g. "add this", "save this info", "update the record with this". Merges data into the enrichment_data field.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                target_table: {
+                    type: 'STRING',
+                    description: 'Which table to update: "lead_targets" or "crm_companies"',
+                },
+                target_id: {
+                    type: 'NUMBER',
+                    description: 'ID of the record to update',
+                },
+                intelligence_key: {
+                    type: 'STRING',
+                    description: 'Key under enrichment_data to store this — e.g. "chat_research", "additional_intel", "competitive_analysis"',
+                },
+                intelligence_value: {
+                    type: 'STRING',
+                    description: 'The intelligence text or summary to save',
+                },
+            },
+            required: ['target_table', 'target_id', 'intelligence_key', 'intelligence_value'],
         },
     },
 ];
@@ -210,6 +261,129 @@ async function executeTool(
             };
         }
 
+        case 'research_entity': {
+            const query = args.query;
+            const entityType = args.entity_type || 'company';
+
+            // Use Exa search to find intelligence
+            try {
+                const exaRes = await fetch('https://api.exa.ai/search', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': env.EXA_API_KEY,
+                    },
+                    body: JSON.stringify({
+                        query: `${query} ${entityType === 'person' ? 'executive background career' : 'company news funding growth'}`,
+                        numResults: 5,
+                        useAutoprompt: true,
+                        type: 'neural',
+                        contents: { text: { maxCharacters: 1500 } },
+                    }),
+                });
+
+                if (!exaRes.ok) {
+                    return { result: { error: `Exa search failed: ${exaRes.status}` } };
+                }
+
+                const exaData = (await exaRes.json()) as any;
+                const results = (exaData.results || []).map((r: any) => ({
+                    title: r.title,
+                    url: r.url,
+                    excerpt: r.text?.slice(0, 500) || '',
+                    publishedDate: r.publishedDate,
+                }));
+
+                // Ask Gemini to summarize the findings
+                const summaryRes = await fetch(geminiUrl(env.GEMINI_API_KEY), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{
+                            role: 'user',
+                            parts: [{
+                                text: `Summarize the following web search results about "${query}" into a concise intelligence brief. Focus on key facts, recent developments, financials, leadership, and strategic opportunities for a law firm looking to provide legal services.\n\nResults:\n${results.map((r: any) => `- ${r.title}: ${r.excerpt}`).join('\n\n')}`,
+                            }],
+                        }],
+                        generationConfig: { temperature: 0.3, maxOutputTokens: 1500 },
+                    }),
+                });
+
+                let summary = '';
+                if (summaryRes.ok) {
+                    const summaryData = (await summaryRes.json()) as any;
+                    summary = summaryData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                }
+
+                return {
+                    result: {
+                        query,
+                        resultCount: results.length,
+                        summary,
+                        sources: results,
+                        canSave: true,
+                    },
+                    uiData: {
+                        type: 'research_results',
+                        summary,
+                        sources: results,
+                    },
+                };
+            } catch (err: any) {
+                return { result: { error: `Research failed: ${err.message}` } };
+            }
+        }
+
+        case 'save_intelligence': {
+            const { target_table, target_id, intelligence_key, intelligence_value } = args;
+
+            if (!['lead_targets', 'crm_companies'].includes(target_table)) {
+                return { result: { error: 'Invalid table. Must be lead_targets or crm_companies.' } };
+            }
+
+            try {
+                // Fetch current enrichment_data
+                const current = await sbQuery(
+                    env,
+                    `${target_table}?id=eq.${target_id}&select=enrichment_data`
+                );
+                const existing = current?.[0]?.enrichment_data || {};
+
+                // Merge new intelligence
+                const updated = {
+                    ...existing,
+                    [intelligence_key]: intelligence_value,
+                    [`${intelligence_key}_added_at`]: new Date().toISOString(),
+                    [`${intelligence_key}_source`]: 'copilot_chat',
+                };
+
+                // Update the record
+                const res = await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/${target_table}?id=eq.${target_id}`,
+                    {
+                        method: 'PATCH',
+                        headers: sbHeaders(env),
+                        body: JSON.stringify({ enrichment_data: updated }),
+                    }
+                );
+
+                if (!res.ok) {
+                    const err = await res.text();
+                    throw new Error(`Update failed: ${err}`);
+                }
+
+                return {
+                    result: {
+                        success: true,
+                        message: `Intelligence saved to ${target_table}#${target_id} under "${intelligence_key}".`,
+                        key: intelligence_key,
+                    },
+                };
+            } catch (err: any) {
+                return { result: { error: `Save failed: ${err.message}` } };
+            }
+        }
+
         default:
             return { result: { error: `Unknown tool: ${name}` } };
     }
@@ -219,12 +393,15 @@ async function executeTool(
 // Main Copilot Chat Function
 // ──────────────────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are the APEX Copilot — a strategic AI assistant embedded in the PPA+ APEX outreach platform.
+function buildSystemPrompt(pageContext?: PageContext): string {
+    let prompt = `You are the APEX Copilot — a strategic AI assistant embedded in the PPA+ APEX outreach platform.
 
 You have access to the following tools:
 - search_pending_strikes: Find pending outreach campaigns waiting for human review/approval
 - create_campaign: Create new outreach campaigns
 - dispatch_custom_strike: Immediately target a specific company with the full AI pipeline
+- research_entity: Search the web for additional intelligence about a company, person, or topic. Use this when the user asks for more info or says "research this."
+- save_intelligence: Save newly discovered intelligence back to the knowledge base. Only use when the user explicitly wants to add or save data.
 
 You should:
 - Be concise, professional, and strategic in your responses
@@ -232,8 +409,58 @@ You should:
 - When showing pending strikes, summarize the results conversationally AND return the data for the UI to render as interactive cards
 - When actions succeed, confirm clearly with specifics
 - When asked general questions, respond helpfully without tools
+- When research_entity returns results, present the key findings clearly and let the user know they can add them to the knowledge base
 
 You are speaking to a senior business development professional. Be direct and action-oriented.`;
+
+    if (pageContext) {
+        const ctx = pageContext;
+        const d = ctx.data || {};
+        prompt += `\n\n--- CURRENT PAGE CONTEXT ---\nThe user is currently viewing a ${ctx.type}.`;
+
+        if (ctx.type === 'strike') {
+            prompt += `\nStrike Opportunity Details:
+- Company: ${d.targetCompany || 'N/A'}
+- Executive: ${d.targetExecutive || 'N/A'}
+- Title: ${d.executiveTitle || 'N/A'}
+- Trigger Event: ${d.triggerEvent || 'N/A'}
+- Persona Used: ${d.personaUsed || 'N/A'}
+- Email Subject: ${d.emailSubject || 'N/A'}
+- Status: ${d.status || 'N/A'}`;
+            if (d.enrichmentData) {
+                const ed = d.enrichmentData;
+                if (ed.trigger_summary) prompt += `\n- Market Opportunity: ${ed.trigger_summary.slice(0, 800)}`;
+                if (ed.executive_research) prompt += `\n- Executive Background: ${ed.executive_research.slice(0, 800)}`;
+                if (ed.company_intelligence) prompt += `\n- Company Intel: ${typeof ed.company_intelligence === 'string' ? ed.company_intelligence.slice(0, 500) : JSON.stringify(ed.company_intelligence).slice(0, 500)}`;
+                if (ed.email) prompt += `\n- Email: ${ed.email}`;
+                if (ed.phone) prompt += `\n- Phone: ${ed.phone}`;
+                if (ed.revenue) prompt += `\n- Revenue: ${ed.revenue}`;
+                if (ed.employees) prompt += `\n- Employees: ${ed.employees}`;
+            }
+            if (ctx.entityId) prompt += `\nTarget ID (for save_intelligence): lead_targets#${ctx.entityId}`;
+        } else if (ctx.type === 'campaign') {
+            prompt += `\nCampaign Details:
+- Name: ${d.name || 'N/A'}
+- Objective: ${d.objective || 'N/A'}
+- Status: ${d.status || 'N/A'}
+- Partner Count: ${d.partnerCount || 0}
+- Strike Count: ${d.strikeCount || 0}`;
+        } else if (ctx.type === 'contact') {
+            prompt += `\nContact/Company Details:
+- Company: ${d.companyName || 'N/A'}
+- Industry: ${d.industry || 'N/A'}
+- Revenue: ${d.revenue || 'N/A'}
+- Employees: ${d.employees || 'N/A'}
+- Territory: ${d.territory || 'N/A'}`;
+            if (ctx.entityId) prompt += `\nCompany ID (for save_intelligence): crm_companies#${ctx.entityId}`;
+        }
+
+        prompt += `\n--- END CONTEXT ---
+CRITICAL: The data above describes what the user is currently looking at. When they say "this company", "this strike", "tell me about them", or any similar reference, ALWAYS use the context data above. NEVER ask "which company?" when you have context data. Start your answer using the company/entity name from the context.`;
+    }
+
+    return prompt;
+}
 
 export async function copilotChat(
     request: CopilotRequest,
@@ -255,7 +482,7 @@ export async function copilotChat(
 
     // First Gemini call — with tool declarations
     const geminiPayload = {
-        system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        system_instruction: { parts: [{ text: buildSystemPrompt(request.pageContext) }] },
         contents,
         tools: [{ function_declarations: TOOL_DECLARATIONS }],
         generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
@@ -325,7 +552,7 @@ export async function copilotChat(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            system_instruction: { parts: [{ text: buildSystemPrompt(request.pageContext) }] },
             contents: contents2,
             generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
         }),
