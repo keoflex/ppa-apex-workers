@@ -43,3 +43,8 @@ max_batch_timeout = 30
 # 9 AM EST (14:00 UTC) + 3 PM EST (20:00 UTC) Mon-Fri — market sensing
 [triggers]
 crons = ["0 14 * * 1-5", "0 20 * * 1-5"]
+
+# ── R2 Storage (uncomment after enabling R2 in Cloudflare dashboard) ──
+# [[r2_buckets]]
+# binding = "CRM_ATTACHMENTS"
+# bucket_name = "crm-attachments"

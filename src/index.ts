@@ -37,6 +37,7 @@ export interface Env {
     ENVIRONMENT: string;
     COURTLISTENER_API_KEY?: string;
     NEWSDATA_API_KEY?: string;
+    CRM_ATTACHMENTS?: R2Bucket;  // enable after R2 activation in dashboard
 }
 
 export default {
@@ -49,8 +50,8 @@ export default {
         // ── CORS headers for cross-origin browser calls ──
         const corsHeaders: Record<string, string> = {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, x-worker-secret',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, x-worker-secret, X-R2-Key',
         };
 
         // Handle preflight OPTIONS
@@ -922,15 +923,70 @@ Return ONLY a JSON object:
             }
         }
 
+        // ── R2 File Storage Endpoints ──
+        // Upload: PUT /api/r2/upload  (X-R2-Key header specifies storage key)
+        if (url.pathname === '/api/r2/upload' && request.method === 'PUT') {
+            try {
+                if (!env.CRM_ATTACHMENTS) return jsonWithCors({ error: 'R2 storage not configured. Enable R2 in Cloudflare dashboard.' }, { status: 503 });
+                const key = request.headers.get('X-R2-Key');
+                if (!key) return jsonWithCors({ error: 'Missing X-R2-Key header' }, { status: 400 });
+
+                const contentType = request.headers.get('Content-Type') || 'application/octet-stream';
+                const body = await request.arrayBuffer();
+
+                await env.CRM_ATTACHMENTS.put(key, body, {
+                    httpMetadata: { contentType },
+                });
+
+                const fileUrl = `${url.origin}/api/r2/file/${key}`;
+                return jsonWithCors({ status: 'uploaded', url: fileUrl, key });
+            } catch (error) {
+                console.error('[R2 upload] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // Get file: GET /api/r2/file/*
+        if (url.pathname.startsWith('/api/r2/file/') && request.method === 'GET') {
+            try {
+                if (!env.CRM_ATTACHMENTS) return jsonWithCors({ error: 'R2 storage not configured' }, { status: 503 });
+                const key = url.pathname.replace('/api/r2/file/', '');
+                const object = await env.CRM_ATTACHMENTS.get(key);
+                if (!object) return jsonWithCors({ error: 'Not found' }, { status: 404 });
+
+                const headers = new Headers(corsHeaders);
+                headers.set('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream');
+                headers.set('Content-Disposition', `inline; filename="${key.split('/').pop()}"`);
+                headers.set('Cache-Control', 'public, max-age=3600');
+
+                return new Response(object.body, { headers });
+            } catch (error) {
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // Delete file: DELETE /api/r2/file/*
+        if (url.pathname.startsWith('/api/r2/file/') && request.method === 'DELETE') {
+            try {
+                if (!env.CRM_ATTACHMENTS) return jsonWithCors({ error: 'R2 storage not configured' }, { status: 503 });
+                const key = url.pathname.replace('/api/r2/file/', '');
+                await env.CRM_ATTACHMENTS.delete(key);
+                return jsonWithCors({ status: 'deleted' });
+            } catch (error) {
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // Regenerate or Deep Research trigger
         if (url.pathname === '/api/regenerate' && request.method === 'POST') {
             try {
-                const body = await request.json() as { workflowId: string; action: 'regenerate' | 'research' };
+                const body = await request.json() as { workflowId: string; action: 'regenerate' | 'research'; steeringNotes?: string };
                 await env.STRIKE_QUEUE.send({
                     campaignId: 0,
                     workflowId: body.workflowId,
                     action: body.action,
                     persona: "Rob O'Neill",
+                    steeringNotes: body.steeringNotes || null,
                 });
                 return jsonWithCors({ status: 'queued' });
             } catch (error) {
@@ -972,9 +1028,23 @@ Return ONLY a JSON object:
                             body: replyBody,
                         });
 
-                        // Write to triage_replies table
+                        // Look up the originating strike campaign for bucketing
+                        let strategicCampaignId: string | null = null;
+                        let assignedTo: string | null = null;
+                        if (campaignId > 0) {
+                            const { fetchRow } = await import('./utils/supabase');
+                            const scRows = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                            if (scRows && scRows.length > 0) {
+                                strategicCampaignId = scRows[0].campaign_id || null;
+                                assignedTo = scRows[0].assigned_to || null;
+                            }
+                        }
+
+                        // Write to triage_replies table with campaign bucketing
                         const insertResult = await insertRow(env, 'triage_replies', {
                             campaign_id: campaignId > 0 ? campaignId : null,
+                            strategic_campaign_id: strategicCampaignId,
+                            assigned_to: assignedTo,
                             sender_name: senderName,
                             sender_company: senderCompany,
                             subject,
@@ -985,7 +1055,7 @@ Return ONLY a JSON object:
                         });
 
                         if (insertResult.ok) {
-                            console.log(`✅ Webhook processed: ${senderName} → ${triageResult.category}`);
+                            console.log(`✅ Webhook processed: ${senderName} → ${triageResult.category}${strategicCampaignId ? ` (Campaign ${strategicCampaignId})` : ''}`);
                         }
 
                         // Mark campaign as 'replied'
@@ -1083,7 +1153,7 @@ Return ONLY a JSON object:
                     continue;
                 }
 
-                const { campaignId, persona, workflowId: regenerateWorkflowId, action } = msg.body;
+                const { campaignId, persona, workflowId: regenerateWorkflowId, action, steeringNotes } = msg.body;
                 console.log(`📨 Queue processing: Campaign #${campaignId} | Persona: ${persona} | Action: ${action || 'new'}`);
 
                 if (action === 'regenerate' || action === 'research') {
@@ -1174,6 +1244,7 @@ Return ONLY a JSON object:
                         triggerHeadline: lead.trigger_event,
                         triggerArticleText,
                         partnerProfiles,
+                        steeringNotes: steeringNotes || undefined,
                     });
 
                     await patchRow(env, 'strike_campaigns', {

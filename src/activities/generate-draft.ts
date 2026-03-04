@@ -12,6 +12,7 @@ export interface DraftInput {
     triggerHeadline: string;
     triggerArticleText?: string;
     partnerProfiles?: any[];  // M:N — array of partner companies
+    steeringNotes?: string;   // Custom instructions from reviewer (e.g. "focus on Polsinelli service areas")
     stepContext?: {
         stepNumber: number;
         totalSteps: number;
@@ -160,7 +161,10 @@ ${input.stepContext.previousEmails.map((e, i) => `--- Email ${i + 1} ---\n${e}`)
 YOUR INSTRUCTION FOR THIS SPECIFIC STEP:
 ${input.stepContext.stepPrompt}` : ''}
 
-Write the outreach email. Sound human. Reference specific deal details. Be brief. ${input.stepContext ? 'Ensure it reads naturally as a follow-up to the previous emails, referencing them lightly if appropriate, but primarily focusing on the specific step instruction.' : ''}`;
+Write the outreach email. Sound human. Reference specific deal details. Be brief. ${input.stepContext ? 'Ensure it reads naturally as a follow-up to the previous emails, referencing them lightly if appropriate, but primarily focusing on the specific step instruction.' : ''}
+
+${input.steeringNotes ? `ADDITIONAL INSTRUCTIONS FROM REVIEWER (incorporate these into the rewrite):
+${input.steeringNotes}` : ''}`;
 
     try {
         const response = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
