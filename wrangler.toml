@@ -44,7 +44,7 @@ max_batch_timeout = 30
 [triggers]
 crons = ["0 14 * * 1-5", "0 20 * * 1-5"]
 
-# ── R2 Storage (uncomment after enabling R2 in Cloudflare dashboard) ──
-# [[r2_buckets]]
-# binding = "CRM_ATTACHMENTS"
-# bucket_name = "crm-attachments"
+# ── R2 Storage ──
+[[r2_buckets]]
+binding = "CRM_ATTACHMENTS"
+bucket_name = "crm-attachments"
