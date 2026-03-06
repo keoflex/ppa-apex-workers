@@ -15,6 +15,7 @@ export interface ExecuteInput {
     emailSubject?: string;
     emailBody?: string;
     recipientEmail?: string;
+    emailAccountIds?: number[];  // SmartLead sender account IDs for this campaign
 }
 
 export interface CampaignResult {
@@ -32,13 +33,14 @@ export async function executeCampaign(env: Env, input: ExecuteInput): Promise<Ca
 
     try {
         // Build the Smartlead campaign payload
-        const payload = {
+        const payload: any = {
             name: `APEX Strike — ${input.workflowId}`,
             ...(input.emailSubject ? { subject: input.emailSubject } : {}),
             ...(input.emailBody ? { body: input.emailBody } : {}),
             ...(input.recipientEmail ? {
                 leads: [{ email: input.recipientEmail }],
             } : {}),
+            ...(input.emailAccountIds?.length ? { email_account_ids: input.emailAccountIds } : {}),
         };
 
         const response = await fetch(`${SMARTLEAD_API_BASE}/campaigns/?api_key=${env.SMARTLEAD_API_KEY}`, {

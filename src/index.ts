@@ -543,10 +543,38 @@ Generate a strategic intelligence profile for this company. Be factual, specific
         // Execute delivery (called by Next.js approve endpoint)
         if (url.pathname === '/api/execute' && request.method === 'POST') {
             try {
-                const body = await request.json() as { workflowId: string; action: string };
+                const body = await request.json() as { workflowId: string; action: string; senderAccounts?: string[] };
+
+                // Resolve sender email addresses → SmartLead account IDs
+                let emailAccountIds: number[] | undefined;
+                if (body.senderAccounts?.length && env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY) {
+                    try {
+                        const emailList = body.senderAccounts.map(e => `"${e}"`).join(',');
+                        const lookupRes = await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/crm_settings_senders?email=in.(${emailList})&select=smartlead_account_id`,
+                            {
+                                headers: {
+                                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                },
+                            }
+                        );
+                        if (lookupRes.ok) {
+                            const senders = await lookupRes.json() as any[];
+                            emailAccountIds = senders
+                                .map(s => parseInt(s.smartlead_account_id, 10))
+                                .filter(id => !isNaN(id));
+                            console.log(`📧 Resolved ${emailAccountIds.length} sender account IDs for strike ${body.workflowId}`);
+                        }
+                    } catch (e) {
+                        console.warn('[execute] Failed to resolve sender accounts:', e);
+                    }
+                }
+
                 const result = await executeCampaign(env, {
                     campaignId: 0,
                     workflowId: body.workflowId,
+                    emailAccountIds,
                 });
                 return Response.json({ status: 'delivered', result });
             } catch (error) {
@@ -1156,6 +1184,17 @@ Return ONLY a JSON object:
                 const { campaignId, persona, workflowId: regenerateWorkflowId, action, steeringNotes } = msg.body;
                 console.log(`📨 Queue processing: Campaign #${campaignId} | Persona: ${persona} | Action: ${action || 'new'}`);
 
+                // Helper to gracefully reset agent status at the end of the pipeline run
+                const resetAgentStatus = async (env: Env, agentId: number) => {
+                    try {
+                        const { patchRow } = await import('./utils/supabase');
+                        await patchRow(env, 'agents', { status: 'active', last_activity: new Date().toISOString() }, 'id', agentId);
+                        console.log(`🔄 Reset Agent #${agentId} to 'active' state.`);
+                    } catch (e) {
+                        console.error(`❌ Failed to reset agent state for #${agentId}`, e);
+                    }
+                };
+
                 if (action === 'regenerate' || action === 'research') {
                     if (!regenerateWorkflowId) {
                         console.error('Missing workflowId for regenerate action');
@@ -1300,7 +1339,7 @@ Return ONLY a JSON object:
                     triggers = await senseTriggersForAgent(env, agent);
 
                     if (triggers.length === 0) {
-                        await patchRow(env, 'agents', { status: 'active' }, 'id', agent.id);
+                        await resetAgentStatus(env, agent.id);
                         console.log(`⚠️ No triggers found for Agent #${agent.id}`);
                         msg.ack();
                         continue;
@@ -1377,6 +1416,9 @@ Return ONLY a JSON object:
 
                 if (newTriggers.length === 0) {
                     console.log(`⚠️ All ${triggers.length} triggers already have leads — skipping.`);
+                    if (action === 'dispatch_agent' && msg.body.agentId) {
+                        await resetAgentStatus(env, msg.body.agentId);
+                    }
                     msg.ack();
                     continue;
                 }
@@ -1517,8 +1559,7 @@ Return ONLY a JSON object:
                         }
 
                         if (action === 'dispatch_agent' && (selectedTrigger as any).agentId) {
-                            const { patchRow } = await import('./utils/supabase');
-                            await patchRow(env, 'agents', { status: 'active' }, 'id', (selectedTrigger as any).agentId);
+                            await resetAgentStatus(env, (selectedTrigger as any).agentId);
                         }
                     } catch (triggerErr) {
                         console.error(`❌ Failed to process trigger for ${selectedTrigger.company}:`, triggerErr);
@@ -1560,9 +1601,19 @@ Return ONLY a JSON object:
                     } catch (_) { /* non-blocking */ }
                 }
 
+                if (action === 'dispatch_agent' && msg.body.agentId) {
+                    await resetAgentStatus(env, msg.body.agentId);
+                }
+
                 msg.ack();
             } catch (error) {
                 console.error(`❌ Queue processing error for Campaign #${msg.body.campaignId || 0}:`, error);
+                if (msg.body.action === 'dispatch_agent' && msg.body.agentId) {
+                    try {
+                        const { patchRow } = await import('./utils/supabase');
+                        await patchRow(env, 'agents', { status: 'active' }, 'id', msg.body.agentId);
+                    } catch (e) { /* non-blocking */ }
+                }
                 msg.retry();
             }
         }
