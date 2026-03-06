@@ -1312,6 +1312,21 @@ Return ONLY a JSON object:
                     }
                     const agent = agentRows[0];
 
+                    // Create a pipeline_run record for agent dispatches so results are visible in the UI
+                    if (!msg.body.runId) {
+                        try {
+                            const runRes = await insertRow(env, 'pipeline_runs', {
+                                run_type: 'agent_dispatch',
+                                agent_name: agent.name || `Agent #${agent.id}`,
+                                status: 'running',
+                                triggered_by: 'manual',
+                                metadata: { agent_id: agent.id, domain: agent.domain },
+                                started_at: new Date().toISOString(),
+                            });
+                            if (runRes?.ok && runRes.data?.[0]) msg.body.runId = runRes.data[0].id;
+                        } catch (_) { /* non-blocking */ }
+                    }
+
                     // M:N: Query campaign_agents for all campaign assignments
                     const caUrl = `${env.SUPABASE_URL}/rest/v1/campaign_agents?agent_id=eq.${msg.body.agentId}&select=campaign_id`;
                     const caRes = await fetch(caUrl, {
@@ -1341,6 +1356,19 @@ Return ONLY a JSON object:
                     if (triggers.length === 0) {
                         await resetAgentStatus(env, agent.id);
                         console.log(`⚠️ No triggers found for Agent #${agent.id}`);
+                        // Record zero-result completion for agent dispatch
+                        if (msg.body.runId) {
+                            try {
+                                await patchRow(env, 'pipeline_runs', {
+                                    status: 'completed',
+                                    triggers_found: 0,
+                                    leads_enriched: 0,
+                                    drafts_generated: 0,
+                                    completed_at: new Date().toISOString(),
+                                    metadata: { agent_id: agent.id, result: 'no_triggers', exa_query: agent.exa_query },
+                                }, 'id', msg.body.runId);
+                            } catch (_) { /* non-blocking */ }
+                        }
                         msg.ack();
                         continue;
                     }
@@ -1355,7 +1383,8 @@ Return ONLY a JSON object:
                         max_leads_per_run: msg.body.maxResults || 5,
                     };
 
-                    // Fan out to all sources in parallel
+                    // Fan out to all sources in parallel with per-source error capture
+                    const sourceNames = ['Exa.ai', 'SEC EDGAR', 'CourtListener', 'News'];
                     const [exaResult, secResult, courtResult, newsResult] = await Promise.allSettled([
                         senseTriggersForAgent(env, virtualAgent),
                         senseSecFilingsForQuery(env, searchQuery),
@@ -1363,9 +1392,24 @@ Return ONLY a JSON object:
                         senseNewsForQuery(env, searchQuery),
                     ]);
 
+                    // Log per-source status for diagnostics
+                    const sourceResults = [exaResult, secResult, courtResult, newsResult];
+                    const sourceStatus: Record<string, string> = {};
+                    const sourceErrors: string[] = [];
+                    sourceResults.forEach((r, i) => {
+                        if (r.status === 'fulfilled') {
+                            sourceStatus[sourceNames[i]] = `${r.value.length} results`;
+                        } else {
+                            sourceStatus[sourceNames[i]] = 'failed';
+                            sourceErrors.push(`${sourceNames[i]}: ${String(r.reason).slice(0, 200)}`);
+                            console.error(`❌ ${sourceNames[i]} failed:`, r.reason);
+                        }
+                    });
+                    console.log(`📡 Source results:`, JSON.stringify(sourceStatus));
+
                     // Merge all successful results
                     const allTriggers: MarketTrigger[] = [];
-                    for (const result of [exaResult, secResult, courtResult, newsResult]) {
+                    for (const result of sourceResults) {
                         if (result.status === 'fulfilled') allTriggers.push(...result.value);
                     }
 
@@ -1382,7 +1426,13 @@ Return ONLY a JSON object:
                                 leads_enriched: 0,
                                 drafts_generated: 0,
                                 completed_at: new Date().toISOString(),
-                                metadata: { query: searchQuery, result: 'no_triggers', sources_checked: 4 },
+                                metadata: {
+                                    query: searchQuery,
+                                    result: 'no_triggers',
+                                    sources_checked: 4,
+                                    source_status: sourceStatus,
+                                    ...(sourceErrors.length > 0 ? { source_errors: sourceErrors } : {}),
+                                },
                             }, 'id', msg.body.runId);
                         }
                         msg.ack();
@@ -1607,11 +1657,24 @@ Return ONLY a JSON object:
 
                 msg.ack();
             } catch (error) {
+                const errorMessage = String(error).slice(0, 500);
                 console.error(`❌ Queue processing error for Campaign #${msg.body.campaignId || 0}:`, error);
+
+                // Record the error to pipeline_runs so the UI can show what went wrong
+                if (msg.body.runId) {
+                    try {
+                        await patchRow(env, 'pipeline_runs', {
+                            status: 'failed',
+                            errors: [{ message: errorMessage, timestamp: new Date().toISOString() }],
+                            completed_at: new Date().toISOString(),
+                        }, 'id', msg.body.runId);
+                    } catch (_) { /* non-blocking */ }
+                }
+
                 if (msg.body.action === 'dispatch_agent' && msg.body.agentId) {
                     try {
-                        const { patchRow } = await import('./utils/supabase');
-                        await patchRow(env, 'agents', { status: 'active' }, 'id', msg.body.agentId);
+                        const { patchRow: pr } = await import('./utils/supabase');
+                        await pr(env, 'agents', { status: 'active' }, 'id', msg.body.agentId);
                     } catch (e) { /* non-blocking */ }
                 }
                 msg.retry();
