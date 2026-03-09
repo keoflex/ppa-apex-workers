@@ -1022,6 +1022,155 @@ Return ONLY a JSON object:
             }
         }
 
+        // ── Generate Variants from Gold Draft ──────────────────────────────
+        if (url.pathname === '/api/generate-variants' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    goldDraft: { name: string; category: string; subject: string; body: string };
+                    reporters: { name: string; email?: string; outlet?: string; beat?: string; recentWork?: string }[];
+                    messagingDirectives: { title: string; directive: string }[];
+                    persona?: string;
+                };
+
+                if (!body.goldDraft || !body.reporters?.length) {
+                    return jsonWithCors({ error: 'goldDraft and reporters[] are required' }, { status: 400 });
+                }
+
+                const apiKey = env.GEMINI_API_KEY;
+                if (!apiKey) {
+                    return jsonWithCors({ error: 'GEMINI_API_KEY not configured' }, { status: 500 });
+                }
+
+                // Fetch system settings for persona/signature
+                let settings: any = null;
+                try {
+                    const settingsRows = await fetchRow(env, 'system_settings', 'id', 1);
+                    if (settingsRows.length > 0) settings = settingsRows[0];
+                } catch { /* use defaults */ }
+
+                const senderName = body.persona || settings?.default_sender_name || 'Fred Polsinelli';
+                const senderTitle = settings?.default_sender_title || 'CEO';
+                const companyName = settings?.company_name || 'Polsinelli Public Affairs, LLC';
+                const signatureBlock = `${senderName}\n${senderTitle}\n${companyName}`;
+
+                const { geminiUrl } = await import('./config/gemini');
+                const gemUrl = geminiUrl(apiKey);
+
+                const variants: any[] = [];
+                const batchId = `batch-${crypto.randomUUID().slice(0, 12)}`;
+
+                // Process reporters sequentially (avoid rate limits)
+                for (const reporter of body.reporters.slice(0, 20)) {
+                    try {
+                        const prompt = `You are ${senderName}, ${senderTitle} at ${companyName}.
+
+FOUNDATION DRAFT (study this email's tone, style, strategic framing, and relationship-building approach):
+Subject: ${body.goldDraft.subject}
+Body:
+${body.goldDraft.body}
+
+${body.messagingDirectives.length > 0 ? `DAILY MESSAGING PRIORITIES (weave these into the email naturally):
+${body.messagingDirectives.map((d, i) => `${i + 1}. [${d.title}] ${d.directive}`).join('\n')}
+` : ''}
+TARGET REPORTER:
+Name: ${reporter.name}
+${reporter.outlet ? `Outlet: ${reporter.outlet}` : ''}
+${reporter.beat ? `Beat/Coverage: ${reporter.beat}` : ''}
+${reporter.recentWork ? `Recent Work: ${reporter.recentWork}` : ''}
+
+TASK:
+Generate a customized version of the foundation draft for this specific reporter. Preserve the original's:
+- Voice, tone, and strategic sophistication
+- Core messaging and value propositions
+- Relationship-building approach
+
+But ADAPT:
+- The opening hook to reference the reporter's specific beat or recent work
+- The angle to align with what this reporter typically covers
+- Any daily messaging priorities that naturally fit
+- The call-to-action to be relevant to their coverage area
+
+RULES:
+1. Keep the same length and structure as the foundation draft
+2. Sound like a thoughtful, experienced professional — NOT an automated system
+3. Maximum 3-4 SHORT paragraphs. No bullet points. No HTML. No bold text. No emojis.
+4. Address them by first name: "${reporter.name.split(' ')[0]},"
+5. End with ONLY this signature block:
+Best,
+${signatureBlock}
+
+Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
+
+                        const geminiRes = await fetch(gemUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                contents: [{ parts: [{ text: prompt }] }],
+                                generationConfig: {
+                                    temperature: 0.8,
+                                    maxOutputTokens: 2000,
+                                    responseMimeType: 'application/json',
+                                },
+                            }),
+                        });
+
+                        if (!geminiRes.ok) {
+                            console.error(`❌ Gemini error for ${reporter.name}:`, await geminiRes.text());
+                            variants.push({
+                                reporter: reporter.name,
+                                email: reporter.email,
+                                outlet: reporter.outlet,
+                                error: 'Gemini generation failed',
+                            });
+                            continue;
+                        }
+
+                        const geminiData = await geminiRes.json() as any;
+                        const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                        let parsed: { subject: string; body: string };
+
+                        try {
+                            const cleaned = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+                            parsed = JSON.parse(cleaned);
+                        } catch {
+                            // Fallback: use raw text as body
+                            parsed = { subject: body.goldDraft.subject, body: rawText };
+                        }
+
+                        variants.push({
+                            reporter: reporter.name,
+                            email: reporter.email,
+                            outlet: reporter.outlet,
+                            beat: reporter.beat,
+                            subject: parsed.subject,
+                            body: parsed.body,
+                            batchId,
+                        });
+
+                        console.log(`✅ Variant generated for ${reporter.name} (${reporter.outlet || 'unknown outlet'})`);
+                    } catch (reporterErr) {
+                        console.error(`❌ Error generating variant for ${reporter.name}:`, reporterErr);
+                        variants.push({
+                            reporter: reporter.name,
+                            email: reporter.email,
+                            error: String(reporterErr),
+                        });
+                    }
+                }
+
+                return jsonWithCors({
+                    status: 'complete',
+                    batchId,
+                    total: body.reporters.length,
+                    generated: variants.filter(v => !v.error).length,
+                    variants,
+                });
+            } catch (error) {
+                console.error('❌ Generate variants error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // Smartlead webhook — inbound reply receiver
         if (url.pathname === '/api/webhook/smartlead' && request.method === 'POST') {
             // Parse the payload synchronously
