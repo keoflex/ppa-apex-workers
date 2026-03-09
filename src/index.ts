@@ -1558,6 +1558,7 @@ Return ONLY a JSON object:
                         // Step 4: Save lead + campaign to Supabase
                         const workflowId = `wf-${crypto.randomUUID().slice(0, 12)}`;
 
+                        const currentAgentId = (selectedTrigger as any).agentId || msg.body.agentId || null;
                         const targetRes = await insertRow(env, 'lead_targets', {
                             company: enrichedLead.company || selectedTrigger.company,
                             executive_name: enrichedLead.executiveName || selectedTrigger.executiveName,
@@ -1565,6 +1566,7 @@ Return ONLY a JSON object:
                             trigger_event: selectedTrigger.headline,
                             trigger_source: selectedTrigger.sourceUrl || null,
                             trigger_relevance: selectedTrigger.relevanceScore || 95,
+                            discovered_by_agent: currentAgentId,
                             enrichment_data: {
                                 data_source: selectedTrigger.source || 'Exa.ai',
                                 revenue: enrichedLead.companyRevenue,
@@ -1602,6 +1604,7 @@ Return ONLY a JSON object:
                                 drafted_body: draft.body,
                                 workflow_id: workflowId,
                                 campaign_id: strategicCampaignId,
+                                agent_id: currentAgentId,
                             });
 
                             // Initialize HITL Gate only if not suppressed
