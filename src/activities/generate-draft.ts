@@ -19,6 +19,9 @@ export interface DraftInput {
         stepPrompt: string;
         previousEmails: string[];
     };
+    goldDrafts?: any[];          // Pre-fetched gold draft exemplars
+    partnerTemplates?: any[];    // Pre-fetched validated partner email templates
+    messagingDirectives?: any[]; // Pre-fetched active daily messaging directives
 }
 
 export interface StrikeDraft {
@@ -30,7 +33,7 @@ export interface StrikeDraft {
 }
 
 // ---------------------------------------------------------------------------
-import { getRow } from '../utils/supabase';
+import { getRow, fetchRows } from '../utils/supabase';
 
 // ---------------------------------------------------------------------------
 
@@ -95,6 +98,47 @@ export async function generateDraft(env: Env, input: DraftInput): Promise<Strike
 
     console.log(`✍️ Generating strike draft as ${default_sender_name} via Gemini 3 Flash...`);
 
+    // ── Fetch Gold Drafts (few-shot exemplars) ──
+    let goldDrafts = input.goldDrafts || [];
+    if (goldDrafts.length === 0) {
+        try {
+            // Fetch up to 3 active gold drafts, preferring those matching the target type
+            const targetTypeFilter = input.lead.executiveTitle?.toLowerCase().includes('reporter') ? 'reporter' : 'general';
+            goldDrafts = await fetchRows(env, `gold_drafts?is_active=eq.true&order=usage_count.asc&limit=3`);
+            // If we got general ones, try to find target-specific ones too
+            if (targetTypeFilter !== 'general') {
+                const specificDrafts = await fetchRows(env, `gold_drafts?is_active=eq.true&target_type=eq.${targetTypeFilter}&order=usage_count.asc&limit=2`);
+                if (specificDrafts.length > 0) goldDrafts = [...specificDrafts, ...goldDrafts.slice(0, 1)];
+            }
+        } catch (e) {
+            console.warn('⚠️ Failed to fetch gold drafts:', e);
+        }
+    }
+
+    // ── Fetch Partner Templates (if partners attached) ──
+    let partnerTemplates = input.partnerTemplates || [];
+    if (partnerTemplates.length === 0 && input.partnerProfiles && input.partnerProfiles.length > 0) {
+        try {
+            for (const partner of input.partnerProfiles.slice(0, 3)) {
+                const templates = await fetchRows(env, `partner_email_templates?partner_id=eq.${partner.id}&is_validated=eq.true&is_active=eq.true&limit=2`);
+                partnerTemplates.push(...templates);
+            }
+        } catch (e) {
+            console.warn('⚠️ Failed to fetch partner templates:', e);
+        }
+    }
+
+    // ── Fetch Daily Messaging Directives ──
+    let messagingDirectives = input.messagingDirectives || [];
+    if (messagingDirectives.length === 0) {
+        try {
+            const now = new Date().toISOString();
+            messagingDirectives = await fetchRows(env, `daily_messaging_directives?is_active=eq.true&or=(expires_at.is.null,expires_at.gt.${now})&order=priority.asc&limit=5`);
+        } catch (e) {
+            console.warn('⚠️ Failed to fetch messaging directives:', e);
+        }
+    }
+
     // Determine if we have a real contact name
     const hasRealName = input.lead.executiveName
         && input.lead.executiveName !== 'Unknown'
@@ -116,6 +160,30 @@ ${p.ai_alignment_rules ? `Strict Alignment Rules: ${p.ai_alignment_rules}` : ''}
 ${p.domain ? `Domain: ${p.domain}` : ''}`).join('\n\n')}
 
 Frame ${company_name} as the strategic advisor orchestrating this syndicate of elite capabilities for the prospect.` : ''}
+${partnerTemplates.length > 0 ? `
+PARTNER-SPECIFIC TEMPLATES (use these as structural and tonal references when incorporating partner value):
+${partnerTemplates.map((t: any, i: number) => `Template ${i + 1}: "${t.name}"
+Use Case: ${t.use_case || 'introduction'}
+Subject: ${t.subject}
+Body:
+${t.body}`).join('\n\n---\n\n')}
+
+Use these validated templates as inspiration for how to weave partner messaging into the email naturally.` : ''}
+${goldDrafts.length > 0 ? `
+FOUNDATION DRAFTS (exemplar emails — match their tone, strategic framing, and relationship-building approach):
+These are high-value, human-crafted emails written by our team. Study their style, structure, voice, and messaging sophistication. Produce a new email that preserves these qualities while customizing content for the specific prospect.
+
+${goldDrafts.map((d: any, i: number) => `--- Exemplar ${i + 1}: "${d.name}" (Category: ${d.category}) ---
+Subject: ${d.subject}
+Body:
+${d.body}`).join('\n\n')}
+
+IMPORTANT: Do NOT copy these drafts verbatim. Use them as a stylistic and strategic foundation. Adapt the content, references, and value propositions to the specific prospect and trigger event.` : ''}
+${messagingDirectives.length > 0 ? `
+DAILY MESSAGING PRIORITIES (adapt all emails to reflect these current strategic themes):
+${messagingDirectives.map((d: any, i: number) => `${i + 1}. [${d.title}] ${d.directive}`).join('\n')}
+
+Weave these priorities naturally into the email's strategic angle where relevant. Do not force them if they don't fit the prospect.` : ''}
 
 WRITING STYLE RULES — THIS IS CRITICAL:
 1. Write like a thoughtful, experienced professional sending a brief, warm, highly personal note. Speak DIRECTLY to the recipient in the first person (i.e. "I saw your recent appointment" instead of "I saw Michelle was appointed"). Do NOT refer to the recipient in the third person if the article is about them.
@@ -267,6 +335,17 @@ ${input.steeringNotes}` : ''}`;
         };
 
         console.log(`✅ Draft generated via Gemini (subject: "${draft.subject}")`);
+
+        // Increment usage_count for gold drafts that were used
+        if (goldDrafts.length > 0) {
+            for (const gd of goldDrafts) {
+                try {
+                    const { patchRow } = await import('../utils/supabase');
+                    await patchRow(env, 'gold_drafts', { usage_count: (gd.usage_count || 0) + 1 }, 'id', gd.id);
+                } catch (_) { /* non-blocking */ }
+            }
+        }
+
         return draft;
     } catch (err) {
         console.error('❌ Gemini draft generation failed, using fallback template:', err);

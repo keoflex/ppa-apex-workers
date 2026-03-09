@@ -142,3 +142,28 @@ export async function fetchRow(
         return [];
     }
 }
+
+/**
+ * FETCH rows from a Supabase table via raw PostgREST query string.
+ * Example: fetchRows(env, 'gold_drafts?is_active=eq.true&order=usage_count.desc&limit=3')
+ */
+export async function fetchRows(
+    env: SupabaseEnv,
+    queryPath: string,
+): Promise<any[]> {
+    const url = `${env.SUPABASE_URL}/rest/v1/${queryPath}`;
+    try {
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: headers(env),
+        });
+        if (!res.ok) {
+            console.error(`[supabase] FETCH ${queryPath} failed (${res.status})`);
+            return [];
+        }
+        return await res.json() as any[];
+    } catch (err) {
+        console.error(`[supabase] FETCH ${queryPath} exception:`, err);
+        return [];
+    }
+}
