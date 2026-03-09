@@ -1263,6 +1263,7 @@ Return ONLY a JSON object:
 
                     // Fetch Partner Profiles (M:N) if this strike belongs to a strategic campaign
                     let partnerProfiles: any[] = [];
+                    let campaignObjective: string | undefined = undefined;
                     if (campaign.campaign_id) {
                         const { fetchRow } = await import('./utils/supabase');
                         // Query campaign_partners join table
@@ -1275,6 +1276,10 @@ Return ONLY a JSON object:
                             const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
                             if (pRows && pRows.length > 0) partnerProfiles.push(pRows[0]);
                         }
+
+                        // Fetch the campaign objective
+                        const campRows = await fetchRow(env, 'campaigns', 'id', campaign.campaign_id);
+                        if (campRows && campRows.length > 0) campaignObjective = campRows[0].objective || undefined;
                     }
 
                     const draft = await generateDraft(env, {
@@ -1283,7 +1288,7 @@ Return ONLY a JSON object:
                         triggerHeadline: lead.trigger_event,
                         triggerArticleText,
                         partnerProfiles,
-                        steeringNotes: steeringNotes || undefined,
+                        steeringNotes: steeringNotes || campaignObjective || undefined,
                     });
 
                     await patchRow(env, 'strike_campaigns', {
@@ -1301,6 +1306,7 @@ Return ONLY a JSON object:
                 let triggers = [];
                 let strategicCampaignId: string | null = null;
                 let partnerProfiles: any[] = [];
+                let campaignObjective: string | undefined = undefined;
 
                 if (action === 'dispatch_agent' && msg.body.agentId) {
                     const { fetchRow, patchRow } = await import('./utils/supabase');
@@ -1348,6 +1354,13 @@ Return ONLY a JSON object:
                             const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
                             if (pRows && pRows.length > 0) partnerProfiles.push(pRows[0]);
                         }
+
+                        // Fetch the campaign objective
+                        if (strategicCampaignId) {
+                            const campRows = await fetchRow(env, 'campaigns', 'id', strategicCampaignId);
+                            if (campRows && campRows.length > 0) campaignObjective = campRows[0].objective || undefined;
+                        }
+
                         console.log(`📋 Agent #${msg.body.agentId} → Campaign ${strategicCampaignId} with ${partnerProfiles.length} partners`);
                     }
 
@@ -1406,6 +1419,28 @@ Return ONLY a JSON object:
                         }
                     });
                     console.log(`📡 Source results:`, JSON.stringify(sourceStatus));
+
+                    // Check if a campaign was assigned to this mission
+                    if (msg.body.campaignId) {
+                        strategicCampaignId = msg.body.campaignId;
+                        const { fetchRow } = await import('./utils/supabase');
+
+                        // Fetch the campaign objective
+                        const campRows = await fetchRow(env, 'campaigns', 'id', msg.body.campaignId);
+                        if (campRows && campRows.length > 0) campaignObjective = campRows[0].objective || undefined;
+
+                        // Fetch all partners for this campaign via campaign_partners
+                        const cpUrl = `${env.SUPABASE_URL}/rest/v1/campaign_partners?campaign_id=eq.${msg.body.campaignId}&select=company_id`;
+                        const cpRes = await fetch(cpUrl, {
+                            headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
+                        });
+                        const cpRows = cpRes.ok ? await cpRes.json() as any[] : [];
+                        for (const cp of cpRows) {
+                            const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
+                            if (pRows && pRows.length > 0) partnerProfiles.push(pRows[0]);
+                        }
+                        console.log(`📋 Search Mission → Campaign ${msg.body.campaignId} with ${partnerProfiles.length} partners attached.`);
+                    }
 
                     // Merge all successful results
                     const allTriggers: MarketTrigger[] = [];
@@ -1516,6 +1551,7 @@ Return ONLY a JSON object:
                                 triggerHeadline: selectedTrigger.headline,
                                 triggerArticleText: selectedTrigger.articleText || '',
                                 partnerProfiles,
+                                steeringNotes: campaignObjective || undefined,
                             });
                         }
 

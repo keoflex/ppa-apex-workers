@@ -12,7 +12,7 @@ export interface DraftInput {
     triggerHeadline: string;
     triggerArticleText?: string;
     partnerProfiles?: any[];  // M:N — array of partner companies
-    steeringNotes?: string;   // Custom instructions from reviewer (e.g. "focus on Polsinelli service areas")
+    steeringNotes?: string;   // Custom instructions from reviewer or campaign objective (e.g. "focus on Polsinelli service areas")
     stepContext?: {
         stepNumber: number;
         totalSteps: number;
@@ -163,7 +163,7 @@ ${input.stepContext.stepPrompt}` : ''}
 
 Write the outreach email. Sound human. Reference specific deal details. Be brief. ${input.stepContext ? 'Ensure it reads naturally as a follow-up to the previous emails, referencing them lightly if appropriate, but primarily focusing on the specific step instruction.' : ''}
 
-${input.steeringNotes ? `ADDITIONAL INSTRUCTIONS FROM REVIEWER (incorporate these into the rewrite):
+${input.steeringNotes ? `CAMPAIGN OBJECTIVE / STEERING INSTRUCTIONS (incorporate these directly into the email strategy and rewrite):
 ${input.steeringNotes}` : ''}`;
 
     try {
