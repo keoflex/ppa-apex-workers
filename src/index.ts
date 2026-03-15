@@ -1937,6 +1937,32 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
         console.log(`⏰ Cron triggered: ${new Date(event.scheduledTime).toISOString()}`);
 
         try {
+            // 0. Clean up stale agents (running >5 min) from previous runs
+            const staleCleanupUrl = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.running&last_activity=lt.${new Date(Date.now() - 5 * 60 * 1000).toISOString()}&select=id,name`;
+            const staleRes = await fetch(staleCleanupUrl, {
+                headers: {
+                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+            });
+            const staleAgents = staleRes.ok ? await staleRes.json() as { id: number; name: string }[] : [];
+            if (staleAgents.length > 0) {
+                const staleIds = staleAgents.map(a => a.id);
+                console.log(`🧹 Resetting ${staleAgents.length} stale agents: ${staleAgents.map(a => `#${a.id}`).join(', ')}`);
+                const resetUrl = `${env.SUPABASE_URL}/rest/v1/agents?id=in.(${staleIds.join(',')})`;
+                await fetch(resetUrl, {
+                    method: 'PATCH',
+                    headers: {
+                        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                        'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'return=minimal',
+                    },
+                    body: JSON.stringify({ status: 'active' }),
+                });
+            }
+
             // 1. Run territory briefings generator first
             await generateTerritoryBriefings(env);
 
