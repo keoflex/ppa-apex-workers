@@ -77,6 +77,31 @@ export default {
             });
         }
 
+        // Service health — live credit check for external APIs (used by platform alert banner)
+        if (url.pathname === '/api/service-health') {
+            const services: Record<string, { status: string; details: string }> = {};
+
+            // Exa.ai credit check
+            try {
+                const exaRes = await fetch('https://api.exa.ai/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': env.EXA_API_KEY },
+                    body: JSON.stringify({ query: 'test', numResults: 1, type: 'neural', contents: { text: { maxCharacters: 10 } } }),
+                });
+                if (exaRes.status === 402) {
+                    services['exa'] = { status: 'credits_exhausted', details: 'Top up at dashboard.exa.ai' };
+                } else if (exaRes.ok) {
+                    services['exa'] = { status: 'operational', details: 'Credits available' };
+                } else {
+                    services['exa'] = { status: 'degraded', details: `HTTP ${exaRes.status}` };
+                }
+            } catch (err) {
+                services['exa'] = { status: 'error', details: String(err).slice(0, 100) };
+            }
+
+            return jsonWithCors({ services });
+        }
+
         // Apollo diagnostic test
         if (url.pathname === '/api/test-apollo' && request.method === 'GET') {
             const hasKey = !!env.APOLLO_API_KEY;
