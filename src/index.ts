@@ -1516,23 +1516,57 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     triggers = await senseTriggersForAgent(env, agent);
 
                     if (triggers.length === 0) {
-                        await resetAgentStatus(env, agent.id);
-                        console.log(`⚠️ No triggers found for Agent #${agent.id}`);
-                        // Record zero-result completion for agent dispatch
-                        if (msg.body.runId) {
-                            try {
-                                await patchRow(env, 'pipeline_runs', {
-                                    status: 'completed',
-                                    triggers_found: 0,
-                                    leads_enriched: 0,
-                                    drafts_generated: 0,
-                                    completed_at: new Date().toISOString(),
-                                    metadata: { agent_id: agent.id, result: 'no_triggers', exa_query: agent.exa_query },
-                                }, 'id', msg.body.runId);
-                            } catch (_) { /* non-blocking */ }
+                        // Exa returned nothing — try secondary sources as fallback
+                        console.log(`⚠️ Exa returned 0 for Agent #${agent.id}, trying secondary sources...`);
+                        const [secResult, courtResult, newsResult] = await Promise.allSettled([
+                            senseSecFilings(env),
+                            senseCourtFilings(env),
+                            senseNews(env),
+                        ]);
+                        const fallbackTriggers: MarketTrigger[] = [];
+                        const sourceStatus: Record<string, string> = {};
+                        for (const [label, result] of [
+                            ['SEC', secResult],
+                            ['Court', courtResult],
+                            ['News', newsResult],
+                        ] as [string, PromiseSettledResult<MarketTrigger[]>][]) {
+                            if (result.status === 'fulfilled') {
+                                fallbackTriggers.push(...result.value);
+                                sourceStatus[label] = `${result.value.length} results`;
+                            } else {
+                                sourceStatus[label] = 'failed';
+                                console.warn(`⚠️ Fallback ${label} failed:`, result.reason);
+                            }
                         }
-                        msg.ack();
-                        continue;
+                        triggers = deduplicateTriggers(fallbackTriggers);
+                        console.log(`📡 Fallback: ${fallbackTriggers.length} raw → ${triggers.length} unique from secondary sources`);
+
+                        if (triggers.length === 0) {
+                            // Truly nothing from any source
+                            await resetAgentStatus(env, agent.id);
+                            console.log(`⚠️ No triggers from any source for Agent #${agent.id}`);
+                            if (msg.body.runId) {
+                                try {
+                                    await patchRow(env, 'pipeline_runs', {
+                                        status: 'completed',
+                                        triggers_found: 0,
+                                        leads_enriched: 0,
+                                        drafts_generated: 0,
+                                        completed_at: new Date().toISOString(),
+                                        metadata: {
+                                            agent_id: agent.id,
+                                            result: 'no_triggers',
+                                            exa_query: agent.exa_query,
+                                            fallback_attempted: true,
+                                            fallback_sources: sourceStatus,
+                                        },
+                                    }, 'id', msg.body.runId);
+                                } catch (_) { /* non-blocking */ }
+                            }
+                            msg.ack();
+                            continue;
+                        }
+                        console.log(`✅ Fallback recovered ${triggers.length} triggers from secondary sources`);
                     }
                 } else if (action === 'search_mission' && msg.body.searchQuery) {
                     // Search Mission: fan out to ALL 4 sources in parallel

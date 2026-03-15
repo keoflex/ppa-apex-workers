@@ -7,7 +7,7 @@
  */
 
 import type { Env } from '../index';
-import { geminiUrl } from '../config/gemini';
+import { geminiUrl, GEMINI_REST_URL } from '../config/gemini';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -139,6 +139,53 @@ const TOOL_DECLARATIONS = [
                 },
             },
             required: ['target_table', 'target_id', 'intelligence_key', 'intelligence_value'],
+        },
+    },
+    {
+        name: 'build_agent',
+        description: 'Create a new AI sensing agent with optimized configuration. Call this ONLY after you have gathered all the necessary information from the user through your interview questions. You MUST have asked about and received answers for: the agent mission/purpose, industry segment, geographic focus, and target keywords/events. Do NOT call this tool until you have all the information needed to build a high-quality agent.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                name: {
+                    type: 'STRING',
+                    description: 'Agent name/callsign — a short, memorable codename (e.g. "C-Suite Tracker", "M&A Scanner")',
+                },
+                description: {
+                    type: 'STRING',
+                    description: 'Mission description — a clear sentence explaining what this agent monitors (e.g. "Identifies newly appointed executives in asset management firms")',
+                },
+                domain: {
+                    type: 'STRING',
+                    description: 'Logical domain category (e.g. "C-Suite Appointments", "M&A Activity", "Regulatory Filings", "Litigation Events", "Market Expansion")',
+                },
+                region: {
+                    type: 'STRING',
+                    description: 'Geographic region focus (e.g. "Global", "Southeast US", "Texas", "Northeast US")',
+                },
+                industry_segment: {
+                    type: 'STRING',
+                    description: 'Industry or sector focus (e.g. "financial services", "corporate", "healthcare", "energy", "real estate")',
+                },
+                target_keywords: {
+                    type: 'ARRAY',
+                    items: { type: 'STRING' },
+                    description: 'Array of optimized keyword phrases for sensing. Use specific, actionable phrases like "newly appointed CEO", "merger announcement", "regulatory approval". Include role titles, event types, and industry terms.',
+                },
+                persona: {
+                    type: 'STRING',
+                    description: 'Sender persona for outreach drafts (default: "Fred Polsinelli")',
+                },
+                schedule: {
+                    type: 'STRING',
+                    description: 'Run schedule: "manual", "daily", or "weekly" (default: "manual")',
+                },
+                max_leads_per_run: {
+                    type: 'NUMBER',
+                    description: 'Maximum leads to process per run (default: 5, range: 1-20)',
+                },
+            },
+            required: ['name', 'description', 'domain', 'region', 'industry_segment', 'target_keywords'],
         },
     },
 ];
@@ -384,6 +431,120 @@ async function executeTool(
             }
         }
 
+        case 'build_agent': {
+            try {
+                const keywords: string[] = args.target_keywords || [];
+                const segment = args.industry_segment || 'General';
+                const region = args.region || 'Global';
+                const agentName = args.name || 'Unnamed Agent';
+                const description = args.description || '';
+
+                // ── Generate optimized Exa query via Gemini ──
+                const exaSystemPrompt = `You are an expert at writing Exa.ai neural search queries.
+Exa queries are optimized for a neural search engine that finds documents by semantic meaning.
+
+Rules for high-performance queries:
+1. Use quoted phrases for exact-match terms (e.g. "newly appointed CEO")
+2. Use OR to combine related terms (e.g. "CEO" OR "Chief Executive Officer")
+3. Include the current year (${new Date().getFullYear()}) to bias toward recent results
+4. Include industry-specific terminology that appears in relevant articles
+5. Include geographic signals when the region is specific (not "Global")
+6. Keep the query focused — quality over quantity of terms
+7. Do NOT wrap the entire output in quotes
+
+Output ONLY the raw query string, nothing else.`;
+
+                const exaUserPrompt = `Agent: ${agentName}
+Mission: ${description}
+Keywords: ${keywords.join(', ')}
+Industry: ${segment}
+Region: ${region}
+
+Generate an optimized Exa neural search query.`;
+
+                let exa_query = `"${keywords.join('" OR "')}" ${segment} ${new Date().getFullYear()}`;
+
+                try {
+                    const geminiRes = await fetch(geminiUrl(env.GEMINI_API_KEY), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            system_instruction: { parts: [{ text: exaSystemPrompt }] },
+                            contents: [{ role: 'user', parts: [{ text: exaUserPrompt }] }],
+                            generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
+                        }),
+                    });
+
+                    if (geminiRes.ok) {
+                        const geminiData = (await geminiRes.json()) as any;
+                        const rawText = geminiData?.candidates?.[0]?.content?.parts?.find((p: any) => p.text)?.text?.trim();
+                        if (rawText) {
+                            exa_query = rawText.replace(/^["']|["']$/g, '').trim();
+                        }
+                    } else {
+                        console.warn('[build_agent] Gemini Exa query generation failed, using keyword fallback');
+                    }
+                } catch (err) {
+                    console.error('[build_agent] Gemini error:', err);
+                }
+
+                // ── Insert agent into Supabase ──
+                const agentData = {
+                    name: agentName,
+                    description,
+                    domain: args.domain || 'General',
+                    region,
+                    industry_segment: segment,
+                    target_keywords: keywords,
+                    exa_query,
+                    persona: args.persona || 'Fred Polsinelli',
+                    schedule: args.schedule || 'manual',
+                    max_leads_per_run: Math.min(Math.max(args.max_leads_per_run || 5, 1), 20),
+                    status: 'idle',
+                    triggers_submitted: 0,
+                    drafts_generated: 0,
+                    active_pipelines: 0,
+                    pending_commission: 0,
+                    last_activity: null,
+                };
+
+                const row = await sbInsert(env, 'agents', agentData);
+
+                console.log(`✅ Agent built via Copilot: "${agentName}" (ID: ${row?.id})`);
+
+                return {
+                    result: {
+                        success: true,
+                        agentId: row?.id,
+                        name: agentName,
+                        description,
+                        domain: args.domain,
+                        region,
+                        industrySegment: segment,
+                        targetKeywords: keywords,
+                        exaQuery: exa_query,
+                        schedule: agentData.schedule,
+                        maxLeadsPerRun: agentData.max_leads_per_run,
+                        message: `Agent "${agentName}" has been deployed successfully with an optimized search configuration.`,
+                    },
+                    uiData: {
+                        type: 'agent_created',
+                        agentId: row?.id,
+                        name: agentName,
+                        description,
+                        domain: args.domain,
+                        region,
+                        industrySegment: segment,
+                        targetKeywords: keywords,
+                        exaQuery: exa_query,
+                    },
+                };
+            } catch (err: any) {
+                console.error('[build_agent] Error:', err);
+                return { result: { error: `Failed to build agent: ${err.message}` } };
+            }
+        }
+
         default:
             return { result: { error: `Unknown tool: ${name}` } };
     }
@@ -402,6 +563,7 @@ You have access to the following tools:
 - dispatch_custom_strike: Immediately target a specific company with the full AI pipeline
 - research_entity: Search the web for additional intelligence about a company, person, or topic. Use this when the user asks for more info or says "research this."
 - save_intelligence: Save newly discovered intelligence back to the knowledge base. Only use when the user explicitly wants to add or save data.
+- build_agent: Create a new AI sensing agent with optimized configuration. Use the Agent Builder Interview flow below.
 
 You should:
 - Be concise, professional, and strategic in your responses
@@ -410,6 +572,26 @@ You should:
 - When actions succeed, confirm clearly with specifics
 - When asked general questions, respond helpfully without tools
 - When research_entity returns results, present the key findings clearly and let the user know they can add them to the knowledge base
+
+## AGENT BUILDER INTERVIEW FLOW
+
+When the user wants to build, create, or deploy a new agent, you MUST conduct a brief guided interview to gather the information needed for an optimized agent. Do NOT call the build_agent tool until you have answers to ALL of the following:
+
+1. **Mission**: "What should this agent monitor for?" Examples: C-suite appointments, M&A activity, regulatory filings, litigation, market expansion, leadership changes, funding rounds.
+2. **Industry**: "Which industry or sector should it focus on?" Examples: financial services, healthcare, energy, real estate, technology, corporate.
+3. **Geography**: "Any geographic focus, or should it be global?" Examples: Southeast US, Texas, Northeast, Global.
+4. **Keywords/Events**: "What specific titles, events, or keywords should it watch for?" Help the user think of targeted phrases. Suggest examples based on their mission.
+
+Ask these questions ONE AT A TIME conversationally (not as a numbered list dump). After each answer, acknowledge it briefly and ask the next question.
+
+After collecting all answers, BEFORE calling the tool:
+- Synthesize the user's answers into enterprise-grade parameters
+- Optimize keywords: use specific phrases like "newly appointed CEO" instead of just "CEO", "merger announcement" instead of "merger"
+- Pick a clear agent codename based on the mission
+- Choose the right domain category
+- Then call build_agent with the optimized parameters
+
+After the agent is created, summarize what was built and recommend the user deploy it from the Agent Network page.
 
 You are speaking to a senior business development professional. Be direct and action-oriented.`;
 

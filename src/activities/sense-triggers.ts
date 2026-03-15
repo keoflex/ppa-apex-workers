@@ -286,7 +286,11 @@ export async function senseTriggersForAgent(env: Env, agent: any): Promise<Marke
 
         if (!res.ok) {
             const errBody = await res.text();
-            console.warn(`⚠️ Exa custom query failed (${res.status}): ${errBody}`);
+            if (res.status === 402) {
+                console.error(`🚨 Exa.ai CREDITS EXHAUSTED for Agent #${agent.id} — top up at dashboard.exa.ai`);
+            } else {
+                console.warn(`⚠️ Exa custom query failed (${res.status}): ${errBody}`);
+            }
             return [];
         }
 
