@@ -37,7 +37,9 @@ import { getRow, fetchRows } from '../utils/supabase';
 
 // ---------------------------------------------------------------------------
 
-import { GEMINI_REST_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { GEMINI_PRO_MODEL } from '../config/gemini';
+import { logGeminiError } from '../utils/gemini-logger';
 
 // ---------------------------------------------------------------------------
 // Fallback template — used when Gemini call fails
@@ -235,7 +237,8 @@ ${input.steeringNotes ? `CAMPAIGN OBJECTIVE / STEERING INSTRUCTIONS (incorporate
 ${input.steeringNotes}` : ''}`;
 
     try {
-        const response = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+        const response = await fetchGemini(env, 'pro', {
+            activityName: 'generate-draft',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -252,6 +255,14 @@ ${input.steeringNotes}` : ''}`;
                     temperature: 0.85,
                     maxOutputTokens: 4096,
                     responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            subject: { type: "STRING" },
+                            body: { type: "STRING" }
+                        },
+                        required: ["subject", "body"]
+                    }
                 },
             }),
         });
@@ -268,69 +279,27 @@ ${input.steeringNotes}` : ''}`;
             }>;
         };
 
-        // Gemini 3 returns thought parts (reasoning) alongside the actual text.
-        // Filter out thought parts and find the real JSON output.
         const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-
-        // First: try non-thought parts (the actual model output)
         const nonThoughtParts = parts.filter((p: any) => p.text && !p.thought);
         let rawText = nonThoughtParts.length > 0
-            ? nonThoughtParts[nonThoughtParts.length - 1].text  // Take LAST non-thought part
-            : null;
-
-        // Fallback: if no non-thought parts, try any part with text
-        if (!rawText) {
-            rawText = parts.filter((p: any) => p.text).pop()?.text;
-        }
+            ? nonThoughtParts[nonThoughtParts.length - 1].text
+            : parts.filter((p: any) => p.text).pop()?.text;
 
         if (!rawText) {
             throw new Error('Gemini returned an empty response');
         }
 
-        // Clean the text: strip markdown code fences if Gemini wraps JSON in ```json...```
-        let cleanedText = rawText.trim();
-        if (cleanedText.startsWith('```')) {
-            cleanedText = cleanedText.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
-        }
-
-        // Parse the JSON payload from the model
-        // Gemini sometimes outputs JSON with literal newlines inside strings, which is invalid.
-        // Fix: escape unescaped newlines within JSON string values before parsing.
-        let parsed: { subject?: string; body?: string };
-        try {
-            parsed = JSON.parse(cleanedText);
-        } catch {
-            // Attempt to fix common JSON issues: literal newlines in string values
-            const fixedText = cleanedText
-                .replace(/\r\n/g, '\\n')
-                .replace(/\n/g, '\\n')
-                .replace(/\t/g, '\\t');
-            try {
-                parsed = JSON.parse(fixedText);
-            } catch {
-                // Last resort: regex extract subject and body
-                const subjectMatch = cleanedText.match(/"subject"\s*:\s*"([^"]+)"/);
-                const bodyMatch = cleanedText.match(/"body"\s*:\s*"([\s\S]+?)"\s*[,}]/);
-                if (subjectMatch && bodyMatch) {
-                    parsed = {
-                        subject: subjectMatch[1],
-                        body: bodyMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
-                    };
-                } else {
-                    throw new Error(`Failed to parse Gemini JSON even with fallbacks. Raw (first 300 chars): ${cleanedText.slice(0, 300)}`);
-                }
-            }
-        }
+        const parsed = JSON.parse(rawText) as { subject?: string; body?: string };
 
         if (!parsed.subject || !parsed.body) {
-            throw new Error(`Gemini response missing subject or body fields. Got: ${cleanedText.slice(0, 200)}`);
+            throw new Error(`Gemini response missing subject or body fields. Got: ${rawText.slice(0, 200)}`);
         }
 
         const draft: StrikeDraft = {
             personaUsed: default_sender_name,
             subject: parsed.subject,
             body: parsed.body,
-            modelUsed: 'gemini-3-flash-preview',
+            modelUsed: GEMINI_PRO_MODEL,
             confidenceScore: 0.91,
         };
 
@@ -349,6 +318,7 @@ ${input.steeringNotes}` : ''}`;
         return draft;
     } catch (err) {
         console.error('❌ Gemini draft generation failed, using fallback template:', err);
+        await logGeminiError(env, 'pro-generate-draft', 'generate-draft', err);
         // Store last error for diagnostics
         (generateDraft as any).__lastError = String(err);
         const fallback = buildFallbackDraft(input, signatureBlock);

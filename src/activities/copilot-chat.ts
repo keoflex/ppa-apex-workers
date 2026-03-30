@@ -7,7 +7,10 @@
  */
 
 import type { Env } from '../index';
-import { geminiUrl, GEMINI_REST_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { GEMINI_PRO_MODEL, GEMINI_LITE_MODEL } from '../config/gemini';
+import { logGeminiError } from '../utils/gemini-logger';
+import { GoogleGenAI, Schema } from '@google/genai';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -342,7 +345,8 @@ async function executeTool(
                 }));
 
                 // Ask Gemini to summarize the findings
-                const summaryRes = await fetch(geminiUrl(env.GEMINI_API_KEY), {
+                const summaryRes = await fetchGemini(env, 'pro', {
+                    activityName: 'copilot-summary',
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -377,6 +381,7 @@ async function executeTool(
                     },
                 };
             } catch (err: any) {
+                await logGeminiError(env, 'pro-copilot-research', 'copilot-chat:research_entity', err);
                 return { result: { error: `Research failed: ${err.message}` } };
             }
         }
@@ -465,7 +470,8 @@ Generate an optimized Exa neural search query.`;
                 let exa_query = `"${keywords.join('" OR "')}" ${segment} ${new Date().getFullYear()}`;
 
                 try {
-                    const geminiRes = await fetch(geminiUrl(env.GEMINI_API_KEY), {
+                    const geminiRes = await fetchGemini(env, 'pro', {
+                        activityName: 'copilot-chat',
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -486,6 +492,7 @@ Generate an optimized Exa neural search query.`;
                     }
                 } catch (err) {
                     console.error('[build_agent] Gemini error:', err);
+                    await logGeminiError(env, 'pro-copilot-build', 'copilot-chat:build_agent', err);
                 }
 
                 // ── Insert agent into Supabase ──
@@ -498,9 +505,9 @@ Generate an optimized Exa neural search query.`;
                     target_keywords: keywords,
                     exa_query,
                     persona: args.persona || 'Fred Polsinelli',
-                    schedule: args.schedule || 'manual',
+                    schedule: args.schedule || 'daily',
                     max_leads_per_run: Math.min(Math.max(args.max_leads_per_run || 5, 1), 20),
-                    status: 'idle',
+                    status: 'active',
                     triggers_submitted: 0,
                     drafts_generated: 0,
                     active_pipelines: 0,
@@ -662,98 +669,96 @@ export async function copilotChat(
     // Add current message
     contents.push({ role: 'user', parts: [{ text: request.message }] });
 
-    // First Gemini call — with tool declarations
-    const geminiPayload = {
-        system_instruction: { parts: [{ text: buildSystemPrompt(request.pageContext) }] },
-        contents,
-        tools: [{ function_declarations: TOOL_DECLARATIONS }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
-    };
+    try {
+        const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+        
+        // Convert TOOL_DECLARATIONS into the format expected by the SDK
+        const formattedTools = [{
+            functionDeclarations: TOOL_DECLARATIONS.map(t => ({
+                name: t.name,
+                description: t.description,
+                parameters: t.parameters as unknown as Schema
+            }))
+        }];
 
-    const res1 = await fetch(geminiUrl(env.GEMINI_API_KEY), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(geminiPayload),
-    });
+        let response;
+        try {
+            response = await ai.models.generateContent({
+                model: GEMINI_PRO_MODEL,
+                contents,
+                config: {
+                    systemInstruction: buildSystemPrompt(request.pageContext),
+                    tools: formattedTools,
+                    temperature: 0.7,
+                    maxOutputTokens: 2048,
+                }
+            });
+        } catch (error: any) {
+            console.warn(`[copilot] PRO model failed (${error.message}). Tripping circuit-breaker to LITE...`);
+            response = await ai.models.generateContent({
+                model: GEMINI_LITE_MODEL,
+                contents,
+                config: {
+                    systemInstruction: buildSystemPrompt(request.pageContext),
+                    tools: formattedTools,
+                    temperature: 0.7,
+                    maxOutputTokens: 2048,
+                }
+            });
+        }
 
-    if (!res1.ok) {
-        const errText = await res1.text();
-        console.error(`[copilot] Gemini error ${res1.status}: ${errText.slice(0, 300)}`);
+        // 1. Direct text response
+        if (response.text && !response.functionCalls?.length) {
+            return {
+                role: 'assistant',
+                text: response.text,
+            };
+        }
+
+        // 2. Tool call response
+        const functionCalls = response.functionCalls;
+        if (functionCalls && functionCalls.length > 0) {
+            const call = functionCalls[0];
+            const name = call.name || 'unknown_tool';
+            const args = call.args as Record<string, any>;
+
+            console.log(`[copilot] Tool call: ${name}`, args);
+
+            try {
+                // Execute the tool dynamically
+                const toolResult = await executeTool(name, args || {}, env);
+                return {
+                    role: 'assistant',
+                    text: `I executed the "${name}" action.`,
+                    uiData: toolResult?.uiData || toolResult?.result,
+                    toolUsed: name,
+                };
+            } catch (toolErr: any) {
+                console.error(`[copilot] Tool execution failed for ${name}:`, toolErr);
+                return {
+                    role: 'assistant',
+                    text: `I tried to run ${name.replace(/_/g, ' ')}, but it failed: ${toolErr.message}`,
+                };
+            }
+        }
+
+        return {
+            role: 'assistant',
+            text: 'I didn\'t quite catch that. Could you rephrase?',
+        };
+
+    } catch (apiErr: any) {
+        console.error(`[copilot] Gemini SDK error:`, apiErr);
+        await logGeminiError(env, 'pro-copilot-main', 'copilot-chat:main', apiErr);
+        if (apiErr.status === 429 || apiErr.message?.includes('429')) {
+             return {
+                 role: 'assistant',
+                 text: 'I am currently receiving too many requests. My AI quota has been exhausted. Please wait a moment and try again.',
+             };
+        }
         return {
             role: 'assistant',
             text: 'I encountered an issue connecting to my AI backend. Please try again.',
         };
     }
-
-    const data1 = (await res1.json()) as any;
-    const candidate = data1?.candidates?.[0];
-    const parts = candidate?.content?.parts || [];
-
-    // Check if Gemini returned a function call
-    const fnCallPart = parts.find((p: any) => p.functionCall);
-
-    if (!fnCallPart) {
-        // No tool call — just return the text
-        const textPart = parts.find((p: any) => p.text);
-        return {
-            role: 'assistant',
-            text: textPart?.text || 'I didn\'t quite catch that. Could you rephrase?',
-        };
-    }
-
-    // ── Execute the tool ──
-    const { name, args } = fnCallPart.functionCall;
-    console.log(`[copilot] Tool call: ${name}`, JSON.stringify(args));
-
-    let toolResult: { result: any; uiData?: any };
-    try {
-        toolResult = await executeTool(name, args || {}, env);
-    } catch (err: any) {
-        console.error(`[copilot] Tool execution error:`, err);
-        toolResult = { result: { error: err.message } };
-    }
-
-    // ── Second Gemini call — pass function response back ──
-    const contents2 = [
-        ...contents,
-        { role: 'model', parts: [{ functionCall: { name, args } }] },
-        {
-            role: 'function',
-            parts: [
-                {
-                    functionResponse: {
-                        name,
-                        response: toolResult.result,
-                    },
-                },
-            ],
-        },
-    ];
-
-    const res2 = await fetch(geminiUrl(env.GEMINI_API_KEY), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            system_instruction: { parts: [{ text: buildSystemPrompt(request.pageContext) }] },
-            contents: contents2,
-            generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
-        }),
-    });
-
-    let finalText = `I executed the "${name}" action. Here are the results.`;
-
-    if (res2.ok) {
-        const data2 = (await res2.json()) as any;
-        const textPart2 = data2?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
-        if (textPart2?.text) {
-            finalText = textPart2.text;
-        }
-    }
-
-    return {
-        role: 'assistant',
-        text: finalText,
-        uiData: toolResult.uiData,
-        toolUsed: name,
-    };
 }

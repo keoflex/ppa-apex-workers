@@ -6,7 +6,8 @@
  */
 import type { Env } from '../index';
 import type { MarketTrigger } from './sense-triggers';
-import { GEMINI_REST_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { logGeminiError } from '../utils/gemini-logger';
 
 // ---------------------------------------------------------------------------
 // SEC EDGAR search API response shape
@@ -156,18 +157,37 @@ async function extractAndBuildTriggers(
 Rules:
 - If no specific name is determinable, use "Unknown" but still provide the likely title
 - Clean up entity names (remove /DE/, /NV/, etc.)
+- CRITICAL: DO NOT output every filing! Only output filings with a relevance score of 50 or higher. Ignore low-relevance filings entirely to keep the JSON array extremely small and fast to generate.
 - Respond with ONLY a JSON array:
 [{ "index": 0, "company": "Company Name", "executiveName": "First Last", "executiveTitle": "CEO", "relevanceScore": 85 }]`;
 
     let extracted: ExtractedMeta[] = [];
     try {
-        const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+        const geminiRes = await fetchGemini(env, 'lite', {
+            activityName: 'sense-sec-filings',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 system_instruction: { parts: [{ text: systemPrompt }] },
                 contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
-                generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+                generationConfig: {
+                    temperature: 0.1,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                index: { type: "INTEGER" },
+                                company: { type: "STRING" },
+                                executiveName: { type: "STRING" },
+                                executiveTitle: { type: "STRING" },
+                                relevanceScore: { type: "INTEGER" }
+                            },
+                            required: ["index", "company", "executiveName", "executiveTitle", "relevanceScore"]
+                        }
+                    }
+                },
             }),
         });
         if (!geminiRes.ok) throw new Error(await geminiRes.text());
@@ -180,6 +200,7 @@ Rules:
         }
     } catch (err) {
         console.error('❌ Gemini SEC extraction failed:', err);
+        await logGeminiError(env, 'lite-sec-extraction', 'sense-sec-filings', err, { itemsCount: hits.length });
         return [];
     }
 

@@ -1,0 +1,521 @@
+{
+    "wallTime": 271,
+    "cpuTime": 6,
+    "truncated": false,
+    "executionModel": "stateless",
+    "outcome": "ok",
+    "scriptVersion": {
+        "id": "67d8e19f-71da-4b6e-bed1-ab39b9d1006e"
+    },
+    "scriptName": "ppa-apex-workers",
+    "diagnosticsChannelEvents": [],
+    "exceptions": [],
+    "logs": [
+        {
+            "message": [
+                "🏷️ Triaging reply from M @ keoflex via Gemini..."
+            ],
+            "level": "log",
+            "timestamp": 1774650509020
+        },
+        {
+            "message": [
+                "❌ Gemini triage failed, falling back to keyword matching:",
+                "Error: Gemini API error 429: {\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"Your project has exceeded its spending cap.\",\n    \"status\": \"RESOURCE_EXHAUSTED\"\n  }\n}\n"
+            ],
+            "level": "error",
+            "timestamp": 1774650509160
+        },
+        {
+            "message": [
+                "[supabase] INSERT triage_replies failed (400): {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'sender_email' column of 'triage_replies' in the schema cache\"}"
+            ],
+            "level": "error",
+            "timestamp": 1774650509285
+        },
+        {
+            "message": [
+                "✅ SES inbound processed: M → not_now"
+            ],
+            "level": "log",
+            "timestamp": 1774650509285
+        }
+    ],
+    "eventTimestamp": 1774650508958,
+    "event": {
+        "request": {
+            "url": "https://ppa-apex-workers.fred-78e.workers.dev/api/webhook/ses",
+            "method": "POST",
+            "headers": {
+                "accept": "*/*",
+                "accept-encoding": "gzip, br",
+                "cf-connecting-ip": "69.62.8.199",
+                "cf-ipcountry": "US",
+                "cf-ray": "9e31d410fa57e9c6",
+                "cf-visitor": "{\"scheme\":\"https\"}",
+                "connection": "Keep-Alive",
+                "content-length": "391",
+                "content-type": "text/plain",
+                "host": "ppa-apex-workers.fred-78e.workers.dev",
+                "user-agent": "node-fetch",
+                "x-forwarded-proto": "https",
+                "x-real-ip": "69.62.8.199"
+            },
+            "cf": {
+                "httpProtocol": "HTTP/1.1",
+                "clientAcceptEncoding": "gzip, deflate, br",
+                "requestPriority": "",
+                "edgeRequestKeepAliveStatus": 1,
+                "requestHeaderNames": {},
+                "clientTcpRtt": 17,
+                "clientQuicRtt": 0,
+                "colo": "DFW",
+                "asn": 31791,
+                "asOrganization": "Region 16 Education Service Center",
+                "country": "US",
+                "isEUCountry": false,
+                "city": "Spearman",
+                "continent": "NA",
+                "region": "Texas",
+                "regionCode": "TX",
+                "timezone": "America/Chicago",
+                "longitude": "-101.19238",
+                "latitude": "36.19837",
+                "postalCode": "79081",
+                "metroCode": "634",
+                "tlsVersion": "TLSv1.3",
+                "tlsCipher": "AEAD-AES256-GCM-SHA384",
+                "tlsClientRandom": "shFPwc54USaRt8nRgRP1fT3D4FXA0PC8ElWEspR3dKU=",
+                "tlsClientCiphersSha1": "kXrN3VEKDdzz2cPKTQaKzpxVTxQ=",
+                "tlsClientExtensionsSha1": "M5Sm/2qrabCxy8tG1NIWsjf99Ug=",
+                "tlsClientExtensionsSha1Le": "C6UcGP66kPwR41Cyi/I/iPOzh/Q=",
+                "tlsExportedAuthenticator": {
+                    "clientHandshake": "21eb2f6db7374a080e952f640c8f3946fccfc96c58d0ac47af8ea6448739badd0929b63c06501fa5f109c992a841ac49",
+                    "serverHandshake": "99b6bed9226f7acfc762a1a8a2dbf6fc586cc905e593c5068cea73b95d5b5fbc3437fd5813e967b4b8d54639ae4c7a20",
+                    "clientFinished": "ec456e594c849cf49e5cf2690748b4c184ff129aad5eb0a70c4a35cf247be9d61016d391a2ae7e503b232a3846bfda70",
+                    "serverFinished": "ea12005d0253bc70a4a2dffdb7e5ae1229c137ae2ab12f565f783cf25641c1a0815932fd46abf2a5efab7a6ab210bbbd"
+                },
+                "tlsClientHelloLength": "1605",
+                "tlsClientAuth": {
+                    "certPresented": "0",
+                    "certVerified": "NONE",
+                    "certRevoked": "0",
+                    "certIssuerDN": "",
+                    "certSubjectDN": "",
+                    "certIssuerDNRFC2253": "",
+                    "certSubjectDNRFC2253": "",
+                    "certIssuerDNLegacy": "",
+                    "certSubjectDNLegacy": "",
+                    "certSerial": "",
+                    "certIssuerSerial": "",
+                    "certSKI": "",
+                    "certIssuerSKI": "",
+                    "certFingerprintSHA1": "",
+                    "certFingerprintSHA256": "",
+                    "certNotBefore": "",
+                    "certNotAfter": "",
+                    "certRFC9440": "",
+                    "certRFC9440TooLarge": false,
+                    "certChainRFC9440": "",
+                    "certChainRFC9440TooLarge": false
+                },
+                "verifiedBotCategory": "",
+                "edgeL4": {
+                    "deliveryRate": 216119
+                }
+            }
+        },
+        "response": {
+            "status": 200
+        }
+    }
+}
+{
+    "wallTime": 284,
+    "cpuTime": 6,
+    "truncated": false,
+    "executionModel": "stateless",
+    "outcome": "ok",
+    "scriptVersion": {
+        "id": "67d8e19f-71da-4b6e-bed1-ab39b9d1006e"
+    },
+    "scriptName": "ppa-apex-workers",
+    "diagnosticsChannelEvents": [],
+    "exceptions": [],
+    "logs": [
+        {
+            "message": [
+                "🏷️ Triaging reply from M @ keoflex via Gemini..."
+            ],
+            "level": "log",
+            "timestamp": 1774650612682
+        },
+        {
+            "message": [
+                "❌ Gemini triage failed, falling back to keyword matching:",
+                "Error: Gemini API error 429: {\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"Your project has exceeded its spending cap.\",\n    \"status\": \"RESOURCE_EXHAUSTED\"\n  }\n}\n"
+            ],
+            "level": "error",
+            "timestamp": 1774650612799
+        },
+        {
+            "message": [
+                "[supabase] INSERT triage_replies failed (400): {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'sender_email' column of 'triage_replies' in the schema cache\"}"
+            ],
+            "level": "error",
+            "timestamp": 1774650612961
+        },
+        {
+            "message": [
+                "✅ SES inbound processed: M → not_now"
+            ],
+            "level": "log",
+            "timestamp": 1774650612961
+        }
+    ],
+    "eventTimestamp": 1774650612682,
+    "event": {
+        "request": {
+            "url": "https://ppa-apex-workers.fred-78e.workers.dev/api/webhook/ses",
+            "method": "POST",
+            "headers": {
+                "accept": "*/*",
+                "accept-encoding": "gzip, br",
+                "cf-connecting-ip": "69.62.8.199",
+                "cf-ipcountry": "US",
+                "cf-ray": "9e31d6993b9af0b4",
+                "cf-visitor": "{\"scheme\":\"https\"}",
+                "connection": "Keep-Alive",
+                "content-length": "391",
+                "content-type": "text/plain",
+                "host": "ppa-apex-workers.fred-78e.workers.dev",
+                "user-agent": "node-fetch",
+                "x-forwarded-proto": "https",
+                "x-real-ip": "69.62.8.199"
+            },
+            "cf": {
+                "httpProtocol": "HTTP/1.1",
+                "clientAcceptEncoding": "gzip, deflate, br",
+                "requestPriority": "",
+                "edgeRequestKeepAliveStatus": 1,
+                "requestHeaderNames": {},
+                "clientTcpRtt": 17,
+                "clientQuicRtt": 0,
+                "colo": "DFW",
+                "asn": 31791,
+                "asOrganization": "Region 16 Education Service Center",
+                "country": "US",
+                "isEUCountry": false,
+                "city": "Spearman",
+                "continent": "NA",
+                "region": "Texas",
+                "regionCode": "TX",
+                "timezone": "America/Chicago",
+                "longitude": "-101.19238",
+                "latitude": "36.19837",
+                "postalCode": "79081",
+                "metroCode": "634",
+                "tlsVersion": "TLSv1.3",
+                "tlsCipher": "AEAD-AES256-GCM-SHA384",
+                "tlsClientRandom": "wEx71vAIXc8nMnSKqPDwySLbz4wWLHG9yTCvSL3qXdo=",
+                "tlsClientCiphersSha1": "kXrN3VEKDdzz2cPKTQaKzpxVTxQ=",
+                "tlsClientExtensionsSha1": "M5Sm/2qrabCxy8tG1NIWsjf99Ug=",
+                "tlsClientExtensionsSha1Le": "C6UcGP66kPwR41Cyi/I/iPOzh/Q=",
+                "tlsExportedAuthenticator": {
+                    "clientHandshake": "3caf2565c958c7a2d6294093625b8534a314308a8c1417837b263945ec72807670063167ba4ab735eb4b154094a33c88",
+                    "serverHandshake": "9b992bc6341554163f062856beb6f9d7024a84435d24f9df9778970b501f16b40231665fbba7b7ca570c8996f6c0dabc",
+                    "clientFinished": "d7d8b7c11f07c76a6a0031d9f636130683b731a6c36f752d964ec8c675af118509f7d71f70d9c979025a1d1453fbd478",
+                    "serverFinished": "fe2f903ac4272a4f8edd8f678eecbb567f9eea5d5e03f782c7c56df358b4139063642409f3095bf70b5284b275dbf564"
+                },
+                "tlsClientHelloLength": "1605",
+                "tlsClientAuth": {
+                    "certPresented": "0",
+                    "certVerified": "NONE",
+                    "certRevoked": "0",
+                    "certIssuerDN": "",
+                    "certSubjectDN": "",
+                    "certIssuerDNRFC2253": "",
+                    "certSubjectDNRFC2253": "",
+                    "certIssuerDNLegacy": "",
+                    "certSubjectDNLegacy": "",
+                    "certSerial": "",
+                    "certIssuerSerial": "",
+                    "certSKI": "",
+                    "certIssuerSKI": "",
+                    "certFingerprintSHA1": "",
+                    "certFingerprintSHA256": "",
+                    "certNotBefore": "",
+                    "certNotAfter": "",
+                    "certRFC9440": "",
+                    "certRFC9440TooLarge": false,
+                    "certChainRFC9440": "",
+                    "certChainRFC9440TooLarge": false
+                },
+                "verifiedBotCategory": "",
+                "edgeL4": {
+                    "deliveryRate": 257804
+                }
+            }
+        },
+        "response": {
+            "status": 200
+        }
+    }
+}
+{
+    "wallTime": 443,
+    "cpuTime": 8,
+    "truncated": false,
+    "executionModel": "stateless",
+    "outcome": "ok",
+    "scriptVersion": {
+        "id": "67d8e19f-71da-4b6e-bed1-ab39b9d1006e"
+    },
+    "scriptName": "ppa-apex-workers",
+    "diagnosticsChannelEvents": [],
+    "exceptions": [],
+    "logs": [
+        {
+            "message": [
+                "🏷️ Triaging reply from M @ keoflex via Gemini..."
+            ],
+            "level": "log",
+            "timestamp": 1774650773344
+        },
+        {
+            "message": [
+                "❌ Gemini triage failed, falling back to keyword matching:",
+                "Error: Gemini API error 429: {\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"Your project has exceeded its spending cap.\",\n    \"status\": \"RESOURCE_EXHAUSTED\"\n  }\n}\n"
+            ],
+            "level": "error",
+            "timestamp": 1774650773481
+        },
+        {
+            "message": [
+                "[supabase] INSERT triage_replies failed (400): {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'source' column of 'triage_replies' in the schema cache\"}"
+            ],
+            "level": "error",
+            "timestamp": 1774650773608
+        },
+        {
+            "message": [
+                "✅ SES inbound processed: M → direct_strike"
+            ],
+            "level": "log",
+            "timestamp": 1774650773608
+        }
+    ],
+    "eventTimestamp": 1774650773113,
+    "event": {
+        "request": {
+            "url": "https://ppa-apex-workers.fred-78e.workers.dev/api/webhook/ses",
+            "method": "POST",
+            "headers": {
+                "accept": "*/*",
+                "accept-encoding": "gzip, br",
+                "cf-connecting-ip": "69.62.8.199",
+                "cf-ipcountry": "US",
+                "cf-ray": "9e31da83ebef45e8",
+                "cf-visitor": "{\"scheme\":\"https\"}",
+                "connection": "Keep-Alive",
+                "content-length": "440",
+                "content-type": "text/plain",
+                "host": "ppa-apex-workers.fred-78e.workers.dev",
+                "user-agent": "node-fetch",
+                "x-forwarded-proto": "https",
+                "x-real-ip": "69.62.8.199"
+            },
+            "cf": {
+                "httpProtocol": "HTTP/1.1",
+                "clientAcceptEncoding": "gzip, deflate, br",
+                "requestPriority": "",
+                "edgeRequestKeepAliveStatus": 1,
+                "requestHeaderNames": {},
+                "clientTcpRtt": 17,
+                "clientQuicRtt": 0,
+                "colo": "DFW",
+                "asn": 31791,
+                "asOrganization": "Region 16 Education Service Center",
+                "country": "US",
+                "isEUCountry": false,
+                "city": "Spearman",
+                "continent": "NA",
+                "region": "Texas",
+                "regionCode": "TX",
+                "timezone": "America/Chicago",
+                "longitude": "-101.19238",
+                "latitude": "36.19837",
+                "postalCode": "79081",
+                "metroCode": "634",
+                "tlsVersion": "TLSv1.3",
+                "tlsCipher": "AEAD-AES256-GCM-SHA384",
+                "tlsClientRandom": "wfozmXVT1Qax3gXmgfTQEm/6KZjPaWdDB9b021lX65A=",
+                "tlsClientCiphersSha1": "kXrN3VEKDdzz2cPKTQaKzpxVTxQ=",
+                "tlsClientExtensionsSha1": "M5Sm/2qrabCxy8tG1NIWsjf99Ug=",
+                "tlsClientExtensionsSha1Le": "C6UcGP66kPwR41Cyi/I/iPOzh/Q=",
+                "tlsExportedAuthenticator": {
+                    "clientHandshake": "1c2f58f1b662bf43a20b582d634d2f9317b252cdcaaaf4a9b3e7c8638782c9d2f1774b9e3d0a07a4f40cf44afaaf9b72",
+                    "serverHandshake": "96211b8f2d2618a03e1236ef6cd93d562dc97b5a35373ebc4c54d54ca38ea752c7bc546a4f86e25c6aa48570082b8582",
+                    "clientFinished": "f226bbaba56c762153b4fb26e846e2fbb256c2cd4c587b39a857407e06849d704398cc0f4c879a430bafe1813ed595ae",
+                    "serverFinished": "701b2112824c7acfa8c85d2efab00dc80e429d6810a9c534afec0215842db72f0363eaf13f6f9f11d1dfbe3a5635a3f9"
+                },
+                "tlsClientHelloLength": "1605",
+                "tlsClientAuth": {
+                    "certPresented": "0",
+                    "certVerified": "NONE",
+                    "certRevoked": "0",
+                    "certIssuerDN": "",
+                    "certSubjectDN": "",
+                    "certIssuerDNRFC2253": "",
+                    "certSubjectDNRFC2253": "",
+                    "certIssuerDNLegacy": "",
+                    "certSubjectDNLegacy": "",
+                    "certSerial": "",
+                    "certIssuerSerial": "",
+                    "certSKI": "",
+                    "certIssuerSKI": "",
+                    "certFingerprintSHA1": "",
+                    "certFingerprintSHA256": "",
+                    "certNotBefore": "",
+                    "certNotAfter": "",
+                    "certRFC9440": "",
+                    "certRFC9440TooLarge": false,
+                    "certChainRFC9440": "",
+                    "certChainRFC9440TooLarge": false
+                },
+                "verifiedBotCategory": "",
+                "edgeL4": {
+                    "deliveryRate": 237936
+                }
+            }
+        },
+        "response": {
+            "status": 200
+        }
+    }
+}
+{
+    "wallTime": 362,
+    "cpuTime": 2,
+    "truncated": false,
+    "executionModel": "stateless",
+    "outcome": "ok",
+    "scriptVersion": {
+        "id": "67d8e19f-71da-4b6e-bed1-ab39b9d1006e"
+    },
+    "scriptName": "ppa-apex-workers",
+    "diagnosticsChannelEvents": [],
+    "exceptions": [],
+    "logs": [
+        {
+            "message": [
+                "🏷️ Triaging reply from M @ keoflex via Gemini..."
+            ],
+            "level": "log",
+            "timestamp": 1774650895600
+        },
+        {
+            "message": [
+                "❌ Gemini triage failed, falling back to keyword matching:",
+                "Error: Gemini API error 429: {\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"Your project has exceeded its spending cap.\",\n    \"status\": \"RESOURCE_EXHAUSTED\"\n  }\n}\n"
+            ],
+            "level": "error",
+            "timestamp": 1774650895728
+        },
+        {
+            "message": [
+                "✅ SES inbound processed: M → direct_strike"
+            ],
+            "level": "log",
+            "timestamp": 1774650895846
+        }
+    ],
+    "eventTimestamp": 1774650895485,
+    "event": {
+        "request": {
+            "url": "https://ppa-apex-workers.fred-78e.workers.dev/api/webhook/ses",
+            "method": "POST",
+            "headers": {
+                "accept": "*/*",
+                "accept-encoding": "gzip, br",
+                "cf-connecting-ip": "69.62.8.199",
+                "cf-ipcountry": "US",
+                "cf-ray": "9e31dd80bd184755",
+                "cf-visitor": "{\"scheme\":\"https\"}",
+                "connection": "Keep-Alive",
+                "content-length": "440",
+                "content-type": "text/plain",
+                "host": "ppa-apex-workers.fred-78e.workers.dev",
+                "user-agent": "node-fetch",
+                "x-forwarded-proto": "https",
+                "x-real-ip": "69.62.8.199"
+            },
+            "cf": {
+                "httpProtocol": "HTTP/1.1",
+                "clientAcceptEncoding": "gzip, deflate, br",
+                "requestPriority": "",
+                "edgeRequestKeepAliveStatus": 1,
+                "requestHeaderNames": {},
+                "clientTcpRtt": 18,
+                "clientQuicRtt": 0,
+                "colo": "DFW",
+                "asn": 31791,
+                "asOrganization": "Region 16 Education Service Center",
+                "country": "US",
+                "isEUCountry": false,
+                "city": "Spearman",
+                "continent": "NA",
+                "region": "Texas",
+                "regionCode": "TX",
+                "timezone": "America/Chicago",
+                "longitude": "-101.19238",
+                "latitude": "36.19837",
+                "postalCode": "79081",
+                "metroCode": "634",
+                "tlsVersion": "TLSv1.3",
+                "tlsCipher": "AEAD-AES256-GCM-SHA384",
+                "tlsClientRandom": "TgBsk/IpKfifdmNGIw9cYzuBG13gt24RPwte5SrKYic=",
+                "tlsClientCiphersSha1": "kXrN3VEKDdzz2cPKTQaKzpxVTxQ=",
+                "tlsClientExtensionsSha1": "M5Sm/2qrabCxy8tG1NIWsjf99Ug=",
+                "tlsClientExtensionsSha1Le": "C6UcGP66kPwR41Cyi/I/iPOzh/Q=",
+                "tlsExportedAuthenticator": {
+                    "clientHandshake": "3c69473ac5897947db0b45c7298c0a291a4643e4686bdf61cecebd9865513a355b48870532b0ffc19355c1f22b4bc395",
+                    "serverHandshake": "6c32f2c53798c6ecf9234964a606a38c33553817adaf4ebb68bd94d37d7352391e95d7b65e52050461cdde3d20016329",
+                    "clientFinished": "2807dd9f1e4e9167469076ec34f57565ca8e04e26246eaf2810081155128e93fe4e6466b1f74f56c8662026981bf7a56",
+                    "serverFinished": "43c1a65f6e775829b416a331c4e1ebe24950f37a0b45276f09731a8b7828c8d6c20c8b94e6f730d7d62120c84a3dff50"
+                },
+                "tlsClientHelloLength": "1605",
+                "tlsClientAuth": {
+                    "certPresented": "0",
+                    "certVerified": "NONE",
+                    "certRevoked": "0",
+                    "certIssuerDN": "",
+                    "certSubjectDN": "",
+                    "certIssuerDNRFC2253": "",
+                    "certSubjectDNRFC2253": "",
+                    "certIssuerDNLegacy": "",
+                    "certSubjectDNLegacy": "",
+                    "certSerial": "",
+                    "certIssuerSerial": "",
+                    "certSKI": "",
+                    "certIssuerSKI": "",
+                    "certFingerprintSHA1": "",
+                    "certFingerprintSHA256": "",
+                    "certNotBefore": "",
+                    "certNotAfter": "",
+                    "certRFC9440": "",
+                    "certRFC9440TooLarge": false,
+                    "certChainRFC9440": "",
+                    "certChainRFC9440TooLarge": false
+                },
+                "verifiedBotCategory": "",
+                "edgeL4": {
+                    "deliveryRate": 224333
+                }
+            }
+        },
+        "response": {
+            "status": 200
+        }
+    }
+}

@@ -4,9 +4,8 @@
  * Cloudflare Worker handling:
  * 1. HTTP requests (manual triggers, health checks, webhook receivers)
  * 2. Queue consumption (strike pipeline processing)
- * 3. Durable Object exports (HITL gate)
+ * 2. Queue consumption (strike pipeline processing)
  */
-import { HitlGateDurableObject } from './durable-objects/hitl-gate';
 import { senseTriggers, senseTriggersForAgent, type MarketTrigger } from './activities/sense-triggers';
 import { senseSecFilings, senseSecFilingsForQuery } from './activities/sense-sec-filings';
 import { senseCourtFilings, senseCourtFilingsForQuery } from './activities/sense-court-filings';
@@ -15,17 +14,16 @@ import { deduplicateTriggers } from './utils/dedup';
 import { enrichLead, type EnrichedLead } from './activities/enrich-lead';
 import type { DraftInput } from './activities/generate-draft';
 import { generateDraft } from './activities/generate-draft';
-import { generateTerritoryBriefings } from './tasks/generate-briefing';
-import { geminiUrl, GEMINI_REST_URL } from './config/gemini';
+import { queueTerritoryBriefings } from './tasks/generate-briefing';
+import { fetchGemini } from './utils/gemini-fetch';
+import { logGeminiError } from './utils/gemini-logger';
 import { executeCampaign } from './activities/execute-campaign';
+import { executeCampaignSes } from './activities/execute-campaign-ses';
 import { triageReply } from './activities/triage-reply';
 import { copilotChat, type CopilotRequest } from './activities/copilot-chat';
 import { insertRow, patchRow, fetchRow } from './utils/supabase';
 
-export { HitlGateDurableObject };
-
 export interface Env {
-    HITL_GATE: DurableObjectNamespace;
     STRIKE_QUEUE: Queue;
     SUPABASE_URL: string;
     SUPABASE_SERVICE_ROLE_KEY: string;
@@ -38,6 +36,11 @@ export interface Env {
     COURTLISTENER_API_KEY?: string;
     NEWSDATA_API_KEY?: string;
     CRM_ATTACHMENTS?: R2Bucket;  // enable after R2 activation in dashboard
+    // Amazon SES credentials
+    AWS_ACCESS_KEY_ID: string;
+    AWS_SECRET_ACCESS_KEY: string;
+    AWS_REGION: string;           // e.g. 'us-east-1'
+    SES_CONFIGURATION_SET?: string;  // optional: for event tracking
 }
 
 export default {
@@ -346,6 +349,93 @@ export default {
             }
         }
 
+        // ── Gemini Email Guesser ──
+        if (url.pathname === '/api/guess-email' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    company: string;
+                    executiveName: string;
+                    domain?: string;
+                };
+
+                console.log(`🧠 Gemini predicting emails for ${body.executiveName} at ${body.company}`);
+
+                const prompt = `You are an expert B2B data researcher and sales intelligence AI with access to Google Search.
+Your task is to identify and generate the most likely email addresses for an executive based on standard corporate syntax or live Google web searches.
+
+Company Name: ${body.company}
+Executive Name: ${body.executiveName}
+${body.domain ? `Company Domain: ${body.domain}` : ''}
+
+Instructions:
+1. CRITICAL: If the Executive Name is "Unknown", "N/A", or "None":
+   - You MUST execute a live Google Search using your internal tools to search for the ACTUAL current CEO, Founder, or President of ${body.company}. Search SEC filings, press releases, and news.
+   - If you can successfully identify the key executive's name (e.g., John Smith), generate the 3-4 most statistically common permutations FOR THAT SPECIFIC PERSON (e.g. john.smith@, jsmith@).
+   - If you find an explicit email address for them in the search results, use it immediately in your guesses.
+   - If your Google Search turns up empty and you cannot identify a specific human executive, you MUST return an empty array: \`{ "guesses": [] }\`. NEVER return generic role-based emails like ceo@ or info@.
+4. You must output ONLY valid JSON matching this exact structure, with NO MARKDOWN CODE BLOCKS:
+{
+  "guesses": [
+    {
+      "email": "string",
+      "rationale": "string indicating WHY you guessed this (e.g. 'Found John Smith as CEO via Google Search. Guessing firstname.lastname format.')"
+    }
+  ],
+  "executiveFound": "string (the actual name of the person you found, e.g. 'John Smith', or null if you did not find anyone)"
+}`;
+
+                const res = await fetchGemini(env, 'lite', {
+                    activityName: 'guess-email',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+                        generationConfig: {
+                            temperature: 0.1,
+                            responseMimeType: 'application/json',
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    guesses: {
+                                        type: "ARRAY",
+                                        items: {
+                                            type: "OBJECT",
+                                            properties: {
+                                                email: { type: "STRING" },
+                                                rationale: { type: "STRING" }
+                                            },
+                                            required: ["email", "rationale"]
+                                        }
+                                    },
+                                    executiveFound: { type: "STRING", description: "The actual name of the person you found, or 'Unknown' if none" }
+                                },
+                                required: ["guesses", "executiveFound"]
+                            }
+                        },
+                        tools: [{ googleSearch: {} }]
+                    })
+                });
+
+                if (!res.ok) {
+                    throw new Error(`Gemini API error ${res.status}`);
+                }
+
+                const data = await res.json() as any;
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+                
+                try {
+                    const parsed = JSON.parse(text);
+                    return jsonWithCors({ status: 'success', guesses: parsed.guesses || [], executiveFound: parsed.executiveFound || null });
+                } catch {
+                    return jsonWithCors({ status: 'error', error: 'Failed to parse Gemini response' });
+                }
+            } catch (err: any) {
+                console.error('[guess-email] Error:', err);
+                await logGeminiError(env, 'pro-guess-email', '/api/guess-email', err);
+                return jsonWithCors({ error: String(err) }, { status: 500 });
+            }
+        }
+
         // AI Resync — Generate company intelligence via Gemini
         if (url.pathname === '/api/ai-resync' && request.method === 'POST') {
             try {
@@ -358,7 +448,7 @@ export default {
 
                 console.log(`🧠 AI Resync requested for ${body.companyName}`);
 
-                const GEMINI_URL = GEMINI_REST_URL;
+
 
                 const systemPrompt = `You are a strategic business intelligence analyst. Research and generate a concise but comprehensive profile of the specified company.
 
@@ -377,13 +467,28 @@ ${body.existingSummary ? `Existing Intel (enrich and expand): ${body.existingSum
 
 Generate a strategic intelligence profile for this company. Be factual, specific, and concise.`;
 
-                const geminiRes = await fetch(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+                const geminiRes = await fetchGemini(env, 'lite', {
+                    activityName: 'ai-resync',
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         system_instruction: { parts: [{ text: systemPrompt }] },
                         contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-                        generationConfig: { temperature: 0.7, maxOutputTokens: 1024, responseMimeType: 'application/json' },
+                        generationConfig: { 
+                            temperature: 0.7, 
+                            maxOutputTokens: 1024, 
+                            responseMimeType: 'application/json',
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    summary: { type: "STRING" },
+                                    industry: { type: "STRING" },
+                                    revenue: { type: "STRING" },
+                                    headcount: { type: "STRING" }
+                                },
+                                required: ["summary", "industry"]
+                            }
+                        },
                     }),
                 });
 
@@ -407,13 +512,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     parsed = JSON.parse(rawText);
                 } catch {
                     console.error('[ai-resync] Failed to parse Gemini output:', rawText.slice(0, 300));
-                    // Try to extract from markdown code block
-                    const jsonMatch = rawText.match(/```json?\s*([\s\S]*?)```/);
-                    if (jsonMatch) {
-                        parsed = JSON.parse(jsonMatch[1].trim());
-                    } else {
-                        return jsonWithCors({ summary: rawText.slice(0, 500), industry: null, revenue: null, headcount: null });
-                    }
+                    return jsonWithCors({ summary: rawText.slice(0, 500), industry: null, revenue: null, headcount: null });
                 }
                 console.log(`✅ AI Resync complete for ${body.companyName}`);
 
@@ -521,6 +620,34 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             try {
                 const body = await request.json() as { campaignId: number; persona: string };
 
+                // ── Auto-reset stale agent locks before every pipeline run ──
+                try {
+                    const { patchRow: patchStale } = await import('./utils/supabase');
+                    const staleRes = await fetch(
+                        `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0&select=id`,
+                        { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                    );
+                    if (staleRes.ok) {
+                        const staleAgents = await staleRes.json() as any[];
+                        if (staleAgents.length > 0) {
+                            await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0`,
+                                {
+                                    method: 'PATCH',
+                                    headers: {
+                                        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                                        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                        'Content-Type': 'application/json',
+                                        Prefer: 'return=minimal',
+                                    },
+                                    body: JSON.stringify({ active_pipelines: 0 }),
+                                }
+                            );
+                            console.log(`🔓 Auto-reset ${staleAgents.length} stale agent locks before pipeline run`);
+                        }
+                    }
+                } catch (e) { console.warn('⚠️ Stale lock reset failed (non-blocking):', e); }
+
                 if (env.STRIKE_QUEUE) {
                     await env.STRIKE_QUEUE.send({
                         campaignId: body.campaignId,
@@ -570,38 +697,50 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             try {
                 const body = await request.json() as { workflowId: string; action: string; senderAccounts?: string[] };
 
-                // Resolve sender email addresses → SmartLead account IDs
-                let emailAccountIds: number[] | undefined;
-                if (body.senderAccounts?.length && env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY) {
-                    try {
-                        const emailList = body.senderAccounts.map(e => `"${e}"`).join(',');
-                        const lookupRes = await fetch(
-                            `${env.SUPABASE_URL}/rest/v1/crm_settings_senders?email=in.(${emailList})&select=smartlead_account_id`,
-                            {
-                                headers: {
-                                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
-                                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-                                },
-                            }
-                        );
-                        if (lookupRes.ok) {
-                            const senders = await lookupRes.json() as any[];
-                            emailAccountIds = senders
-                                .map(s => parseInt(s.smartlead_account_id, 10))
-                                .filter(id => !isNaN(id));
-                            console.log(`📧 Resolved ${emailAccountIds.length} sender account IDs for strike ${body.workflowId}`);
-                        }
-                    } catch (e) {
-                        console.warn('[execute] Failed to resolve sender accounts:', e);
+                // Look up the strike campaign from Supabase to get email content + recipient
+                const campaignRows = await fetchRow(env, 'strike_campaigns', 'workflow_id', body.workflowId);
+                const campaign = campaignRows?.[0];
+
+                if (!campaign) {
+                    return Response.json({ error: `Strike campaign not found: ${body.workflowId}` }, { status: 404 });
+                }
+
+                // Get the target lead's email
+                let recipientEmail = '';
+                if (campaign.target_id) {
+                    const targetRows = await fetchRow(env, 'lead_targets', 'id', campaign.target_id);
+                    if (targetRows?.[0]) {
+                        const target = targetRows[0];
+                        recipientEmail = target.email || target.enrichment_data?.email || '';
                     }
                 }
 
-                const result = await executeCampaign(env, {
-                    campaignId: 0,
-                    workflowId: body.workflowId,
-                    emailAccountIds,
-                });
-                return Response.json({ status: 'delivered', result });
+                if (!recipientEmail) {
+                    return Response.json({ error: 'No recipient email found for this strike' }, { status: 400 });
+                }
+
+                // Send via Amazon SES
+                const senderEmail = body.senderAccounts?.[0] || 'fred@polsinellimgmt.com';
+
+                // Queue the delivery via STRIKE_QUEUE for throttled sending
+                if (env.STRIKE_QUEUE) {
+                    await env.STRIKE_QUEUE.send({
+                        action: 'deliver',
+                        campaignId: Number(campaign.id) || 0,
+                        workflowId: body.workflowId,
+                        emailSubject: campaign.email_subject || `Introduction — ${campaign.workflow_id}`,
+                        emailBody: campaign.drafted_body || campaign.email_body || '',
+                        recipientEmail,
+                        senderEmail,
+                        senderName: 'Fred Posinelli',
+                    });
+                    console.log(`📤 Queued throttled delivery for Workflow #${body.workflowId}`);
+                } else {
+                    console.warn(`⚠️ STRIKE_QUEUE not bound, unable to queue delivery for Workflow #${body.workflowId}`);
+                    return Response.json({ error: 'System configuration error: STRIKE_QUEUE not bound' }, { status: 500 });
+                }
+
+                return Response.json({ status: 'queued', message: 'Delivery queued for throttled sending' });
             } catch (error) {
                 return Response.json({ error: String(error) }, { status: 500 });
             }
@@ -648,9 +787,10 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     `[Item ${i}]\nTitle: ${r.title}\nText: ${r.text ?? r.highlights?.join(' ') ?? ''}\nURL: ${r.url}`
                 ).join('\n\n');
 
-                const geminiRes = await fetch(
-                    geminiUrl(env.GEMINI_API_KEY),
+                const geminiRes = await fetchGemini(
+                    env, 'pro',
                     {
+                        activityName: 'test-pipeline',
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -793,7 +933,345 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             }
         }
 
-        // Search Mission — run a one-off targeted search query through the pipeline
+        // Generate Client Intelligence Brief (called by platform)
+        if (url.pathname === '/api/generate-brief' && request.method === 'POST') {
+            try {
+                const secret = request.headers.get('x-worker-secret');
+                if (!secret || secret !== env.WORKER_SECRET) {
+                    return jsonWithCors({ error: 'Unauthorized' }, { status: 401 });
+                }
+
+                const body = await request.json() as {
+                    companyName: string;
+                    domain?: string;
+                    industry?: string;
+                    existingSummary?: string;
+                    watchDomains?: string[];
+                    watchTopics?: string[];
+                };
+
+                console.log(`📊 Generating intelligence brief for ${body.companyName}`);
+
+                // Step 1: Exa search for recent news about the company
+                const searchQueries = [
+                    `${body.companyName} ${new Date().getFullYear()} news announcement`,
+                    ...(body.watchTopics?.length ? [`${body.companyName} ${body.watchTopics.join(' ')}`] : []),
+                ];
+
+                const allResults: Array<{ title: string; text: string; url: string }> = [];
+
+                for (const query of searchQueries.slice(0, 2)) {
+                    try {
+                        const exaRes = await fetch('https://api.exa.ai/search', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'x-api-key': env.EXA_API_KEY },
+                            body: JSON.stringify({
+                                query,
+                                numResults: 5,
+                                type: 'neural',
+                                useAutoprompt: true,
+                                contents: { text: { maxCharacters: 500 }, highlights: { numSentences: 2, highlightsPerUrl: 1 } },
+                            }),
+                        });
+                        if (exaRes.ok) {
+                            const exaData = await exaRes.json() as any;
+                            for (const r of (exaData.results || [])) {
+                                allResults.push({ title: r.title || '', text: r.text || r.highlights?.join(' ') || '', url: r.url || '' });
+                            }
+                        }
+                    } catch (err) {
+                        console.warn(`[generate-brief] Exa search failed for query: ${query}`, err);
+                    }
+                }
+
+                // Step 2: Gemini synthesis
+
+                const systemPrompt = `You are a strategic intelligence analyst for Polsinelli, a major Am Law 100 law firm.
+Your job is to create a concise intelligence brief about a specific company that helps attorneys understand what is happening
+with their client or prospect, and spot cross-sell opportunities.
+
+OUTPUT FORMAT: Respond with a JSON object ONLY (no markdown):
+{
+  "title": "Brief title (e.g., 'Weekly Intelligence: Acme Corp')",
+  "content": "2-4 paragraph markdown brief covering key developments, market movements, and strategic implications. Be specific and actionable.",
+  "keyFindings": ["Finding 1", "Finding 2", "Finding 3"],
+  "crossSellOpportunities": ["Opportunity 1 - which practice area could help", "Opportunity 2"],
+  "sourceUrls": ["url1", "url2"]
+}`;
+
+                const newsContext = allResults.length > 0
+                    ? allResults.map((r, i) => `[${i + 1}] ${r.title}\n${r.text}\nURL: ${r.url}`).join('\n\n')
+                    : 'No recent news articles found. Generate brief from known information.';
+
+                const userPrompt = `Company: ${body.companyName}
+${body.domain ? `Domain: ${body.domain}` : ''}
+${body.industry ? `Industry: ${body.industry}` : ''}
+${body.existingSummary ? `Existing Intel: ${body.existingSummary}` : ''}
+${body.watchTopics?.length ? `Watch Topics: ${body.watchTopics.join(', ')}` : ''}
+
+Recent News:
+${newsContext}
+
+Generate a strategic intelligence brief for this company. Focus on actionable insights and cross-sell opportunities for a law firm.`;
+
+                const geminiRes = await fetchGemini(env, 'lite', {
+                    activityName: 'generate-brief',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        system_instruction: { parts: [{ text: systemPrompt }] },
+                        contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+                        generationConfig: {
+                            temperature: 0.7,
+                            maxOutputTokens: 2048,
+                            responseMimeType: 'application/json',
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    title: { type: "STRING" },
+                                    content: { type: "STRING" },
+                                    keyFindings: { type: "ARRAY", items: { type: "STRING" } },
+                                    crossSellOpportunities: { type: "ARRAY", items: { type: "STRING" } },
+                                    sourceUrls: { type: "ARRAY", items: { type: "STRING" } }
+                                },
+                                required: ["title", "content", "keyFindings"]
+                            }
+                        },
+                    }),
+                });
+
+                if (!geminiRes.ok) {
+                    const errText = await geminiRes.text();
+                    console.error(`[generate-brief] Gemini error ${geminiRes.status}: ${errText}`);
+                    return jsonWithCors({ error: `Gemini API error` }, { status: 502 });
+                }
+
+                const geminiData = await geminiRes.json() as any;
+                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+                const rawText = parts.find((p: any) => p.text)?.text;
+
+                if (!rawText) {
+                    return jsonWithCors({ error: 'Gemini returned empty response' }, { status: 502 });
+                }
+
+                let parsed: any;
+                try {
+                    parsed = JSON.parse(rawText);
+                } catch {
+                    parsed = { title: `Intelligence Brief: ${body.companyName}`, content: rawText, keyFindings: [], crossSellOpportunities: [], sourceUrls: [] };
+                }
+
+                console.log(`✅ Brief generated for ${body.companyName}: ${parsed.title}`);
+
+                return jsonWithCors({
+                    title: parsed.title || `Intelligence Brief: ${body.companyName}`,
+                    content: parsed.content || '',
+                    keyFindings: parsed.keyFindings || [],
+                    crossSellOpportunities: parsed.crossSellOpportunities || [],
+                    sourceUrls: parsed.sourceUrls || allResults.map(r => r.url).filter(Boolean),
+                });
+            } catch (error: any) {
+                console.error('[generate-brief] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // ── Classify Reply — Gemini-powered reply intent classification ──
+        if (url.pathname === '/api/classify-reply' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    replyBody: string;
+                    originalSubject?: string;
+                    originalBody?: string;
+                    senderName?: string;
+                    senderCompany?: string;
+                };
+
+                if (!body.replyBody) {
+                    return jsonWithCors({ error: 'replyBody required' }, { status: 400 });
+                }
+
+                const classifyPrompt = `You are an expert classifier for legal business development email replies.
+
+Classify this reply into exactly ONE category:
+- "interested" — They want to learn more, asked a question, or showed positive intent
+- "objection" — They pushed back, said timing is bad, or need convincing  
+- "meeting_request" — They explicitly requested a call/meeting or suggested times
+- "not_now" — Polite decline, not interested at this time
+- "out_of_office" — Auto-reply or OOO message
+- "unsubscribe" — Wants to be removed from communications
+
+Also provide:
+- confidence: float 0-1
+- summary: 1 sentence summary of their intent
+- suggested_action: what the sales team should do next
+
+Original email subject: ${body.originalSubject || '(unknown)'}
+Original email context: ${(body.originalBody || '').slice(0, 500)}
+Reply from: ${body.senderName || 'Unknown'} at ${body.senderCompany || 'Unknown'}
+
+REPLY TO CLASSIFY:
+${body.replyBody.slice(0, 2000)}
+
+Return ONLY valid JSON:
+{
+  "classification": "interested|objection|meeting_request|not_now|out_of_office|unsubscribe",
+  "confidence": 0.95,
+  "summary": "...",
+  "suggested_action": "..."
+}`;
+
+                const geminiRes = await fetchGemini(env, 'lite', {
+                    activityName: 'classify-reply',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: classifyPrompt }] }],
+                        generationConfig: {
+                            temperature: 0.1,
+                            maxOutputTokens: 500,
+                            responseMimeType: 'application/json',
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    classification: { type: "STRING", enum: ["interested", "objection", "meeting_request", "not_now", "out_of_office", "unsubscribe"] },
+                                    confidence: { type: "NUMBER" },
+                                    summary: { type: "STRING" },
+                                    suggested_action: { type: "STRING" }
+                                },
+                                required: ["classification", "confidence", "summary", "suggested_action"]
+                            }
+                        },
+                    }),
+                });
+
+                if (!geminiRes.ok) {
+                    return jsonWithCors({ error: 'Gemini classification failed' }, { status: 502 });
+                }
+
+                const geminiData = await geminiRes.json() as any;
+                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+                const rawText = parts.find((p: any) => p.text)?.text || '';
+
+                let result: any;
+                try {
+                    result = JSON.parse(rawText);
+                } catch {
+                    result = { classification: 'not_now', confidence: 0.5, summary: 'Could not parse reply', suggested_action: 'Manual review needed' };
+                }
+
+                console.log(`🧠 Reply classified: ${result.classification} (${result.confidence}) — ${result.summary}`);
+                return jsonWithCors(result);
+            } catch (error: any) {
+                console.error('[classify-reply] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // ── Generate Follow-up — AI-crafted contextual follow-up email ──
+        if (url.pathname === '/api/generate-followup' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    strikeId: number;
+                    stepNumber: number;
+                    replyClassification?: string;
+                    replySummary?: string;
+                    originalSubject?: string;
+                    originalBody?: string;
+                    company?: string;
+                    executive?: string;
+                    persona?: string;
+                };
+
+                if (!body.strikeId) {
+                    return jsonWithCors({ error: 'strikeId required' }, { status: 400 });
+                }
+
+                // Strategy based on classification
+                const strategies: Record<string, string> = {
+                    interested: 'They showed interest. Provide a specific value proposition and suggest a concrete next step like a 15-minute call.',
+                    objection: 'They had concerns. Address their specific objection empathetically, provide social proof or a case study, and offer a low-commitment next step.',
+                    not_now: 'They declined for now. Respect their timing, add value with a relevant insight, and leave the door open for future contact.',
+                    meeting_request: 'They want to meet! Confirm the meeting request, suggest 2-3 specific time slots, and briefly outline what you will cover.',
+                    out_of_office: 'They are out of office. This is a timed follow-up to reconnect when they return.',
+                };
+
+                const strategy = strategies[body.replyClassification || 'not_now'] || strategies.not_now;
+
+                const followUpPrompt = `You are a senior business development strategist at a top-100 law firm (Posinelli).
+Write a follow-up email (step ${body.stepNumber} in the sequence).
+
+Context:
+- Company: ${body.company || 'Unknown'}
+- Executive: ${body.executive || 'Unknown'}
+- Original subject: ${body.originalSubject || '(unknown)'}
+- Original email: ${(body.originalBody || '').slice(0, 800)}
+- Reply classification: ${body.replyClassification || 'no reply yet'}
+- Reply summary: ${body.replySummary || 'No reply received'}
+- Persona: ${body.persona || 'Trusted Advisor'}
+
+Strategy: ${strategy}
+
+Rules:
+- Be concise (3-4 paragraphs max)
+- Sound natural and human, not templated
+- Reference specific details from the original outreach
+- ${body.stepNumber > 2 ? 'This is a later follow-up. Be brief and add fresh value.' : 'This is the first follow-up. Reference the original email naturally.'}
+- Sign off as a Polsinelli attorney
+
+Return ONLY valid JSON:
+{
+  "subject": "Re: ...",
+  "body": "...",
+  "reasoning": "Brief note on why this approach was chosen"
+}`;
+
+                const geminiRes = await fetchGemini(env, 'pro', {
+                    activityName: 'generate-followup',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: followUpPrompt }] }],
+                        generationConfig: {
+                            temperature: 0.7,
+                            maxOutputTokens: 1500,
+                            responseMimeType: 'application/json',
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    subject: { type: "STRING" },
+                                    body: { type: "STRING" },
+                                    reasoning: { type: "STRING" }
+                                },
+                                required: ["subject", "body", "reasoning"]
+                            }
+                        },
+                    }),
+                });
+
+                if (!geminiRes.ok) {
+                    return jsonWithCors({ error: 'Gemini follow-up generation failed' }, { status: 502 });
+                }
+
+                const geminiData = await geminiRes.json() as any;
+                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
+                const rawText = parts.find((p: any) => p.text)?.text || '';
+
+                let result: any;
+                try {
+                    result = JSON.parse(rawText);
+                } catch {
+                    result = { subject: `Follow-up: ${body.originalSubject || 'Our conversation'}`, body: rawText, reasoning: 'Raw Gemini output' };
+                }
+
+                console.log(`📧 Follow-up generated for strike ${body.strikeId} step ${body.stepNumber}: ${result.subject}`);
+                return jsonWithCors(result);
+            } catch (error: any) {
+                console.error('[generate-followup] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         if (url.pathname === '/api/search-mission' && request.method === 'POST') {
             try {
                 const body = await request.json() as {
@@ -894,8 +1372,9 @@ Generate a strategic intelligence profile for this company. Be factual, specific
 
                             // Summarize with Gemini
                             if (allText && env.GEMINI_API_KEY) {
-                                const { GEMINI_REST_URL } = await import('./config/gemini');
-                                const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+                                const { fetchGemini } = await import('./utils/gemini-fetch');
+                                const geminiRes = await fetchGemini(env, 'lite', {
+                                    activityName: 'evaluate-sequence-condition',
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({
@@ -915,7 +1394,23 @@ Return ONLY a JSON object:
   "headquarters": "city, state if known"
 }` }]
                                         }],
-                                        generationConfig: { temperature: 0.2, maxOutputTokens: 1024, responseMimeType: 'application/json' },
+                                        generationConfig: {
+                                            temperature: 0.2,
+                                            maxOutputTokens: 1024,
+                                            responseMimeType: 'application/json',
+                                            responseSchema: {
+                                                type: "OBJECT",
+                                                properties: {
+                                                    website: { type: "STRING" },
+                                                    description: { type: "STRING" },
+                                                    keyFacts: { type: "ARRAY", items: { type: "STRING" } },
+                                                    recentNews: { type: "ARRAY", items: { type: "STRING" } },
+                                                    industry: { type: "STRING" },
+                                                    headquarters: { type: "STRING" }
+                                                },
+                                                required: ["website", "description", "industry"]
+                                            }
+                                        },
                                     }),
                                 });
 
@@ -1078,8 +1573,7 @@ Return ONLY a JSON object:
                 const companyName = settings?.company_name || 'Polsinelli Public Affairs, LLC';
                 const signatureBlock = `${senderName}\n${senderTitle}\n${companyName}`;
 
-                const { geminiUrl } = await import('./config/gemini');
-                const gemUrl = geminiUrl(apiKey);
+                const { fetchGemini } = await import('./utils/gemini-fetch');
 
                 const variants: any[] = [];
                 const batchId = `batch-${crypto.randomUUID().slice(0, 12)}`;
@@ -1126,7 +1620,8 @@ ${signatureBlock}
 
 Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
-                        const geminiRes = await fetch(gemUrl, {
+                        const geminiRes = await fetchGemini(env, 'lite', {
+                            activityName: 'generate-variant',
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -1135,6 +1630,14 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                     temperature: 0.8,
                                     maxOutputTokens: 2000,
                                     responseMimeType: 'application/json',
+                                    responseSchema: {
+                                        type: "OBJECT",
+                                        properties: {
+                                            subject: { type: "STRING" },
+                                            body: { type: "STRING" }
+                                        },
+                                        required: ["subject", "body"]
+                                    }
                                 },
                             }),
                         });
@@ -1155,8 +1658,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         let parsed: { subject: string; body: string };
 
                         try {
-                            const cleaned = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-                            parsed = JSON.parse(cleaned);
+                            parsed = JSON.parse(rawText);
                         } catch {
                             // Fallback: use raw text as body
                             parsed = { subject: body.goldDraft.subject, body: rawText };
@@ -1264,6 +1766,46 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         if (campaignId > 0) {
                             const { patchRow } = await import('./utils/supabase');
                             await patchRow(env, 'strike_campaigns', { status: 'replied' }, 'id', campaignId);
+
+                            // Record engagement event for Intelligence closed-loop tracking
+                            await insertRow(env, 'engagement_events', {
+                                strike_id: campaignId,
+                                event_type: 'reply',
+                                metadata: {
+                                    sender_name: senderName,
+                                    sender_company: senderCompany,
+                                    category: triageResult.category,
+                                    confidence: triageResult.confidence,
+                                },
+                            });
+
+                            // Update replied_at convenience column (only if not already set)
+                            await patchRow(env, 'strike_campaigns', { replied_at: new Date().toISOString() }, 'id', campaignId);
+
+                            // Bump conversion score (+5 for reply)
+                            const scData = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                            if (scData && scData.length > 0) {
+                                const currentScore = Number(scData[0].conversion_score) || 0;
+                                await patchRow(env, 'strike_campaigns', { conversion_score: currentScore + 5 }, 'id', campaignId);
+                            }
+
+                            // If category is 'direct_strike' (high intent), auto-record meeting_booked engagement
+                            if (triageResult.category === 'direct_strike') {
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'meeting_booked',
+                                    metadata: { auto_detected: true, source: 'reply_triage' },
+                                });
+                                await patchRow(env, 'strike_campaigns', { meeting_booked_at: new Date().toISOString() }, 'id', campaignId);
+                                // +10 for meeting
+                                const scData2 = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                                if (scData2 && scData2.length > 0) {
+                                    const cs = Number(scData2[0].conversion_score) || 0;
+                                    await patchRow(env, 'strike_campaigns', { conversion_score: cs + 10 }, 'id', campaignId);
+                                }
+                            }
+
+                            console.log(`📊 Engagement event recorded: reply for strike ${campaignId}`);
                         }
                     } catch (err) {
                         console.error('❌ Webhook background processing error:', err);
@@ -1273,6 +1815,396 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
             // Smartlead gets 200 instantly — no timeout risk
             return Response.json({ status: 'accepted' });
+        }
+
+        // ── Amazon SES Inbound Reply Webhook (via SNS) ──
+        if (url.pathname === '/api/webhook/ses' && request.method === 'POST') {
+            const rawBody = await request.text();
+            let snsMessage: any;
+
+            try {
+                snsMessage = JSON.parse(rawBody);
+            } catch {
+                return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+            }
+
+            // Handle SNS SubscriptionConfirmation (auto-confirm)
+            if (snsMessage.Type === 'SubscriptionConfirmation' && snsMessage.SubscribeURL) {
+                console.log('[ses-webhook] Auto-confirming SNS subscription...');
+                await fetch(snsMessage.SubscribeURL);
+                return Response.json({ status: 'subscription_confirmed' });
+            }
+
+            // Handle SNS Notification (inbound email)
+            if (snsMessage.Type === 'Notification') {
+                ctx.waitUntil(
+                    (async () => {
+                        try {
+                            const message = JSON.parse(snsMessage.Message);
+                            const mailContent = message.mail || message.content || message;
+                            const receipt = message.receipt || {};
+
+                            // Extract email fields from SES inbound format
+                            const fromHeader = mailContent.commonHeaders?.from?.[0] || mailContent.source || '';
+                            const fromMatch = fromHeader.match(/^(?:"?(.+?)"?\s*)?<?([^>]+@[^>]+)>?$/);
+                            const senderName = fromMatch?.[1]?.trim() || fromMatch?.[2] || 'Unknown';
+                            const senderEmail = fromMatch?.[2] || fromHeader;
+                            const senderCompany = senderEmail.split('@')[1]?.split('.')[0] || 'Unknown';
+                            const subject = mailContent.commonHeaders?.subject || mailContent.subject || '(no subject)';
+                            const replyBody = message.content || mailContent.content || '';
+
+                            // Try to match to originating campaign via In-Reply-To header or subject
+                            let campaignId = 0;
+                            const inReplyTo = mailContent.commonHeaders?.inReplyTo || '';
+                            if (inReplyTo) {
+                                // Look up the SES message ID in our campaigns
+                                const rows = await fetchRow(env, 'strike_campaigns', 'ses_message_id', inReplyTo.replace(/[<>]/g, ''));
+                                if (rows?.[0]) {
+                                    campaignId = Number(rows[0].id) || 0;
+                                }
+                            }
+
+                            // Run through existing AI triage pipeline
+                            const triageResult = await triageReply(env, {
+                                senderName,
+                                senderCompany,
+                                subject,
+                                body: replyBody,
+                            });
+
+                            // Look up strategic campaign for bucketing
+                            let strategicCampaignId: string | null = null;
+                            let assignedTo: string | null = null;
+                            if (campaignId > 0) {
+                                const scRows = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                                if (scRows?.[0]) {
+                                    strategicCampaignId = scRows[0].campaign_id || null;
+                                    assignedTo = scRows[0].assigned_to || null;
+                                }
+                            }
+
+                            // Write to triage_replies (same as SmartLead webhook)
+                            await insertRow(env, 'triage_replies', {
+                                campaign_id: campaignId > 0 ? campaignId : null,
+                                strategic_campaign_id: strategicCampaignId,
+                                assigned_to: assignedTo,
+                                sender_name: senderName,
+                                sender_company: senderCompany,
+                                sender_email: senderEmail,
+                                subject,
+                                body: replyBody,
+                                category: triageResult.category,
+                                confidence: triageResult.confidence,
+                                preview: replyBody.slice(0, 200),
+                                source: 'ses',
+                            });
+
+                            // Update campaign status + engagement tracking
+                            if (campaignId > 0) {
+                                await patchRow(env, 'strike_campaigns', { status: 'replied', replied_at: new Date().toISOString() }, 'id', campaignId);
+
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'reply',
+                                    metadata: {
+                                        sender_name: senderName,
+                                        sender_email: senderEmail,
+                                        category: triageResult.category,
+                                        confidence: triageResult.confidence,
+                                        source: 'ses',
+                                    },
+                                });
+
+                                // Bump conversion score (+5 for reply)
+                                const scData = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                                if (scData?.[0]) {
+                                    const currentScore = Number(scData[0].conversion_score) || 0;
+                                    await patchRow(env, 'strike_campaigns', { conversion_score: currentScore + 5 }, 'id', campaignId);
+                                }
+
+                                // Auto-detect high intent
+                                if (triageResult.category === 'direct_strike') {
+                                    await insertRow(env, 'engagement_events', {
+                                        strike_id: campaignId,
+                                        event_type: 'meeting_booked',
+                                        metadata: { auto_detected: true, source: 'ses_reply_triage' },
+                                    });
+                                    await patchRow(env, 'strike_campaigns', { meeting_booked_at: new Date().toISOString() }, 'id', campaignId);
+                                }
+                            }
+
+                            console.log(`✅ SES inbound processed: ${senderName} → ${triageResult.category}`);
+                        } catch (err) {
+                            console.error('❌ SES webhook processing error:', err);
+                        }
+                    })()
+                );
+
+                return Response.json({ status: 'accepted' });
+            }
+
+            return Response.json({ status: 'ignored' });
+        }
+
+        // ── Amazon SES Event Webhook (bounces, complaints, opens, clicks via SNS) ──
+        if (url.pathname === '/api/webhook/ses-events' && request.method === 'POST') {
+            const rawBody = await request.text();
+            let snsMessage: any;
+
+            try {
+                snsMessage = JSON.parse(rawBody);
+            } catch {
+                return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+            }
+
+            // Auto-confirm SNS subscription
+            if (snsMessage.Type === 'SubscriptionConfirmation' && snsMessage.SubscribeURL) {
+                await fetch(snsMessage.SubscribeURL);
+                return Response.json({ status: 'subscription_confirmed' });
+            }
+
+            if (snsMessage.Type === 'Notification') {
+                ctx.waitUntil(
+                    (async () => {
+                        try {
+                            const event = JSON.parse(snsMessage.Message);
+                            const eventType = event.eventType || event.notificationType || '';
+                            const sesMessageId = event.mail?.messageId || '';
+
+                            // Find the campaign by SES message ID
+                            let campaignId = 0;
+                            if (sesMessageId) {
+                                const rows = await fetchRow(env, 'strike_campaigns', 'ses_message_id', sesMessageId);
+                                if (rows?.[0]) {
+                                    campaignId = Number(rows[0].id) || 0;
+                                }
+                            }
+
+                            if (campaignId <= 0) {
+                                console.warn(`[ses-events] No campaign found for SES message: ${sesMessageId}`);
+                                return;
+                            }
+
+                            // Handle each event type
+                            if (eventType === 'Bounce' || eventType === 'bounce') {
+                                const bounceType = event.bounce?.bounceType === 'Permanent' ? 'hard' : 'soft';
+                                const bouncedRecipients = event.bounce?.bouncedRecipients || [];
+
+                                await patchRow(env, 'strike_campaigns', {
+                                    bounced_at: new Date().toISOString(),
+                                    bounce_type: bounceType,
+                                    status: 'bounced',
+                                }, 'id', campaignId);
+
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'bounce',
+                                    metadata: { bounce_type: bounceType, recipients: bouncedRecipients },
+                                });
+
+                                // Flag bounced emails in lead_targets
+                                for (const recipient of bouncedRecipients) {
+                                    const email = recipient.emailAddress;
+                                    if (email) {
+                                        // Find lead_target by email and flag it
+                                        const lookupRes = await fetch(
+                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?email=eq.${encodeURIComponent(email)}&select=id`,
+                                            {
+                                                headers: {
+                                                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                                                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                                },
+                                            }
+                                        );
+                                        if (lookupRes.ok) {
+                                            const leads = await lookupRes.json() as any[];
+                                            for (const lead of leads) {
+                                                await patchRow(env, 'lead_targets', {
+                                                    email_status: bounceType === 'hard' ? 'bounced' : 'soft_bounce',
+                                                    email_status_updated_at: new Date().toISOString(),
+                                                }, 'id', lead.id);
+                                            }
+                                        }
+                                        
+                                        // Flag in suppression list to prevent future sends
+                                        await insertRow(env, 'suppression_list', {
+                                            email,
+                                            reason: bounceType === 'hard' ? 'SES Hard Bounce' : 'SES Soft Bounce',
+                                        });
+                                    }
+                                }
+
+                                console.log(`📮 Bounce (${bounceType}) recorded for campaign ${campaignId}`);
+
+                            } else if (eventType === 'Complaint' || eventType === 'complaint') {
+                                const complainedRecipients = event.complaint?.complainedRecipients || [];
+
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'complaint',
+                                    metadata: { recipients: complainedRecipients },
+                                });
+
+                                // Flag complained emails
+                                for (const recipient of complainedRecipients) {
+                                    const email = recipient.emailAddress;
+                                    if (email) {
+                                        const lookupRes = await fetch(
+                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?email=eq.${encodeURIComponent(email)}&select=id`,
+                                            {
+                                                headers: {
+                                                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                                                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                                },
+                                            }
+                                        );
+                                        if (lookupRes.ok) {
+                                            const leads = await lookupRes.json() as any[];
+                                            for (const lead of leads) {
+                                                await patchRow(env, 'lead_targets', {
+                                                    email_status: 'complained',
+                                                    email_status_updated_at: new Date().toISOString(),
+                                                }, 'id', lead.id);
+                                            }
+                                        }
+                                        
+                                        // Add explicit suppression
+                                        await insertRow(env, 'suppression_list', {
+                                            email,
+                                            reason: 'SES SPAM Complaint',
+                                        });
+                                    }
+                                }
+
+                                console.log(`🚫 Complaint recorded for campaign ${campaignId}`);
+
+                            } else if (eventType === 'Delivery' || eventType === 'delivery') {
+                                await patchRow(env, 'strike_campaigns', {
+                                    delivered_at: new Date().toISOString(),
+                                }, 'id', campaignId);
+
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'delivery',
+                                    metadata: {},
+                                });
+
+                                console.log(`✉️ Delivery confirmed for campaign ${campaignId}`);
+
+                            } else if (eventType === 'Open' || eventType === 'open') {
+                                await patchRow(env, 'strike_campaigns', {
+                                    opened_at: new Date().toISOString(),
+                                }, 'id', campaignId);
+
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'open',
+                                    metadata: {},
+                                });
+
+                                // Bump conversion score (+1 for open)
+                                const scData = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                                if (scData?.[0]) {
+                                    const cs = Number(scData[0].conversion_score) || 0;
+                                    await patchRow(env, 'strike_campaigns', { conversion_score: cs + 1 }, 'id', campaignId);
+                                }
+
+                                console.log(`👁️ Open tracked for campaign ${campaignId}`);
+
+                            } else if (eventType === 'Click' || eventType === 'click') {
+                                await patchRow(env, 'strike_campaigns', {
+                                    clicked_at: new Date().toISOString(),
+                                }, 'id', campaignId);
+
+                                await insertRow(env, 'engagement_events', {
+                                    strike_id: campaignId,
+                                    event_type: 'click',
+                                    metadata: { link: event.click?.link || '' },
+                                });
+
+                                // Bump conversion score (+2 for click)
+                                const scData = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                                if (scData?.[0]) {
+                                    const cs = Number(scData[0].conversion_score) || 0;
+                                    await patchRow(env, 'strike_campaigns', { conversion_score: cs + 2 }, 'id', campaignId);
+                                }
+
+                                console.log(`🔗 Click tracked for campaign ${campaignId}`);
+                            }
+                        } catch (err) {
+                            console.error('❌ SES event processing error:', err);
+                        }
+                    })()
+                );
+
+                return Response.json({ status: 'accepted' });
+            }
+
+            return Response.json({ status: 'ignored' });
+        }
+
+        // Engagement tracking webhook — handles opens, clicks, bounces from SmartLead or any source
+        if (url.pathname === '/api/webhook/engagement' && request.method === 'POST') {
+            const body = await request.json() as {
+                campaign_id?: number | string;
+                event_type?: string;        // 'open', 'click', 'bounce', 'unsubscribe'
+                lead_email?: string;
+                metadata?: Record<string, any>;
+            };
+
+            const campaignId = typeof body.campaign_id === 'string'
+                ? parseInt(body.campaign_id, 10)
+                : body.campaign_id ?? 0;
+
+            const eventType = body.event_type || 'open';
+
+            if (campaignId <= 0) {
+                return jsonWithCors({ error: 'Invalid campaign_id' }, { status: 400 });
+            }
+
+            ctx.waitUntil(
+                (async () => {
+                    try {
+                        // Record engagement event
+                        await insertRow(env, 'engagement_events', {
+                            strike_id: campaignId,
+                            event_type: eventType,
+                            metadata: {
+                                lead_email: body.lead_email || null,
+                                ...(body.metadata || {}),
+                            },
+                        });
+
+                        // Update convenience columns  
+                        const { patchRow } = await import('./utils/supabase');
+                        const colMap: Record<string, string> = {
+                            open: 'opened_at',
+                            click: 'clicked_at',
+                        };
+                        const col = colMap[eventType];
+                        if (col) {
+                            await patchRow(env, 'strike_campaigns', { [col]: new Date().toISOString() }, 'id', campaignId);
+                        }
+
+                        // Bump conversion score
+                        const scoreMap: Record<string, number> = { open: 1, click: 2, bounce: 0 };
+                        const addScore = scoreMap[eventType] ?? 0;
+                        if (addScore > 0) {
+                            const scData = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                            if (scData && scData.length > 0) {
+                                const currentScore = Number(scData[0].conversion_score) || 0;
+                                await patchRow(env, 'strike_campaigns', { conversion_score: currentScore + addScore }, 'id', campaignId);
+                            }
+                        }
+
+                        console.log(`📊 Engagement ${eventType} recorded for strike ${campaignId}`);
+                    } catch (err) {
+                        console.error(`❌ Engagement webhook error:`, err);
+                    }
+                })()
+            );
+
+            return Response.json({ status: 'accepted', event_type: eventType, campaign_id: campaignId });
         }
 
         // ── Temporary Diagnostic: Test full generateDraft pipeline ──────
@@ -1362,12 +2294,50 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 const resetAgentStatus = async (env: Env, agentId: number) => {
                     try {
                         const { patchRow } = await import('./utils/supabase');
-                        await patchRow(env, 'agents', { status: 'active', last_activity: new Date().toISOString() }, 'id', agentId);
-                        console.log(`🔄 Reset Agent #${agentId} to 'active' state.`);
+                        await patchRow(env, 'agents', { status: 'active', active_pipelines: 0, last_activity: new Date().toISOString() }, 'id', agentId);
+                        console.log(`🔄 Reset Agent #${agentId} to 'active' state (pipeline lock cleared).`);
                     } catch (e) {
                         console.error(`❌ Failed to reset agent state for #${agentId}`, e);
                     }
                 };
+
+                if (action === 'generate_briefing') {
+                    console.log(`🌍 Generating territory briefing for [ID: ${msg.body.territoryId}] ${msg.body.territoryName}`);
+                    try {
+                        const { processTerritoryBriefing } = await import('./tasks/generate-briefing');
+                        await processTerritoryBriefing(env, msg.body.territoryId, msg.body.territoryName);
+                        msg.ack();
+                    } catch (err) {
+                        console.error(`❌ Briefing generation failed:`, err);
+                        msg.retry();
+                    }
+                    continue;
+                }
+
+                if (action === 'deliver') {
+                    console.log(`🚀 Throttled delivery starting for Workflow #${msg.body.workflowId}...`);
+                    try {
+                        const result = await executeCampaignSes(env, {
+                            campaignId: msg.body.campaignId || 0,
+                            workflowId: msg.body.workflowId,
+                            emailSubject: msg.body.emailSubject,
+                            emailBody: msg.body.emailBody,
+                            recipientEmail: msg.body.recipientEmail,
+                            senderEmail: msg.body.senderEmail,
+                            senderName: msg.body.senderName || 'Fred Posinelli',
+                        });
+                        console.log(`✅ Email sent via SES: ${result.sesMessageId}`);
+                        
+                        // Enforce a 15-second delay to safely throttle batch campaigns and protect IP reputation.
+                        // Cloudflare Queue consumers can execute for up to 15 minutes.
+                        await new Promise(resolve => setTimeout(resolve, 15000));
+                        msg.ack();
+                    } catch (err) {
+                        console.error(`❌ Failed to send throttled email for Workflow #${msg.body.workflowId}:`, err);
+                        msg.retry();
+                    }
+                    continue;
+                }
 
                 if (action === 'regenerate' || action === 'research') {
                     if (!regenerateWorkflowId) {
@@ -1538,7 +2508,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         console.log(`📋 Agent #${msg.body.agentId} → Campaign ${strategicCampaignId} with ${partnerProfiles.length} partners`);
                     }
 
-                    triggers = await senseTriggersForAgent(env, agent);
+                    triggers = await senseTriggersForAgent(env, agent, msg.body.runId);
 
                     if (triggers.length === 0) {
                         // Exa returned nothing — try secondary sources as fallback
@@ -1607,7 +2577,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     // Fan out to all sources in parallel with per-source error capture
                     const sourceNames = ['Exa.ai', 'SEC EDGAR', 'CourtListener', 'News'];
                     const [exaResult, secResult, courtResult, newsResult] = await Promise.allSettled([
-                        senseTriggersForAgent(env, virtualAgent),
+                        senseTriggersForAgent(env, virtualAgent, msg.body.runId),
                         senseSecFilingsForQuery(env, searchQuery),
                         senseCourtFilingsForQuery(env, searchQuery),
                         senseNewsForQuery(env, searchQuery),
@@ -1696,14 +2666,22 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     }
                 }
 
-                // Process ALL non-duplicate triggers (not just the first)
+                // Process ALL non-duplicate triggers (N+1 query fixed)
                 const newTriggers = [];
+                const companyNames = triggers.map(t => t.company).filter(Boolean);
+                
+                let existingCompanies = new Set<string>();
+                if (companyNames.length > 0) {
+                    const { fetchRowsIn } = await import('./utils/supabase');
+                    const existingRows = await fetchRowsIn(env, 'lead_targets', 'company', companyNames);
+                    existingCompanies = new Set(existingRows.map((r: any) => r.company));
+                }
+
                 for (const t of triggers) {
-                    const existing = await fetchRow(env, 'lead_targets', 'company', t.company);
-                    if (existing.length === 0) {
+                    if (!existingCompanies.has(t.company)) {
                         newTriggers.push(t);
                     } else {
-                        console.log(`🔄 Skipping duplicate: ${t.company}`);
+                        console.log(`🔄 Skipping duplicate (String match): ${t.company}`);
                     }
                 }
 
@@ -1726,6 +2704,21 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             executiveName: selectedTrigger.executiveName,
                             executiveTitle: selectedTrigger.executiveTitle,
                         });
+
+                        // Robust Domain-Level Deduplication (Post-Apollo)
+                        if (enrichedLead.companyDomain) {
+                            const domainRes = await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/lead_targets?enrichment_data->>companyDomain=eq.${encodeURIComponent(enrichedLead.companyDomain)}&select=id`,
+                                { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                            );
+                            if (domainRes.ok) {
+                                const matchedDomains = await domainRes.json() as any[];
+                                if (matchedDomains.length > 0) {
+                                    console.log(`🔄 Skipping duplicate (Domain match via Apollo): ${enrichedLead.companyDomain}`);
+                                    continue;
+                                }
+                            }
+                        }
 
                         // Step 2.5: Compliance & Suppression Check
                         let isSuppressed = false;
@@ -1804,36 +2797,29 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
                         if (targetRes.ok && targetRes.data && targetRes.data.length > 0) {
                             const targetId = targetRes.data[0].id;
+                            // Tier 1 Auto-Clearance Logic
+                            const isTierOne = selectedTrigger.relevanceScore >= 90 && enrichedLead.emailConfidence === 'verified';
+                            const targetStatus = isSuppressed ? 'suppressed' : (isTierOne ? 'approved' : 'pending_hitl');
+
                             const campaignRes = await insertRow(env, 'strike_campaigns', {
                                 target_id: targetId,
-                                status: isSuppressed ? 'suppressed' : 'pending_hitl',
+                                status: targetStatus,
                                 persona_used: persona,
                                 email_subject: draft.subject,
                                 drafted_body: draft.body,
                                 workflow_id: workflowId,
                                 campaign_id: strategicCampaignId,
                                 agent_id: currentAgentId,
+                                ...(isTierOne ? { approved_at: new Date().toISOString() } : {}),
                             });
 
-                            // Initialize HITL Gate only if not suppressed
-                            if (!isSuppressed && campaignRes.ok && campaignRes.data?.[0]?.id) {
-                                try {
-                                    const gateId = env.HITL_GATE.idFromName(workflowId);
-                                    const gate = env.HITL_GATE.get(gateId);
-                                    await gate.fetch(new Request('https://hitl/init', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                            campaignId: campaignRes.data[0].id,
-                                            workflowId,
-                                            persona,
-                                            draftSubject: draft.subject,
-                                            draftBody: draft.body,
-                                        }),
-                                    }));
-                                } catch (gateErr) {
-                                    console.warn('⚠️ HITL Gate init failed (non-blocking):', gateErr);
-                                }
+                            // Instantly dispatch Tier 1 leads to SES delivery queue
+                            if (isTierOne && !isSuppressed && env.STRIKE_QUEUE) {
+                                console.log(`🚀 Tier 1 Auto-Clearance: Instantly dispatching ${enrichedLead.email} to SES`);
+                                await env.STRIKE_QUEUE.send({
+                                    workflowId,
+                                    action: 'deliver',
+                                });
                             }
 
                             console.log(`✅ Lead #${targetId} created: ${enrichedLead.executiveName} @ ${enrichedLead.company} — "${draft.subject}"`);
@@ -1847,7 +2833,6 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                     await patchRow(env, 'agents', {
                                         triggers_submitted: (a.triggers_submitted || 0) + 1,
                                         drafts_generated: (a.drafts_generated || 0) + 1,
-                                        active_pipelines: 1,
                                         status: 'active',
                                         last_activity: new Date().toISOString(),
                                     }, 'id', agentId);
@@ -1855,7 +2840,8 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             } catch (_) { /* non-blocking */ }
                         }
 
-                        if (action === 'dispatch_agent' && (selectedTrigger as any).agentId) {
+                        // Always reset agent lock after trigger processing (not just dispatch_agent)
+                        if ((selectedTrigger as any).agentId) {
                             await resetAgentStatus(env, (selectedTrigger as any).agentId);
                         }
                     } catch (triggerErr) {
@@ -1898,7 +2884,8 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     } catch (_) { /* non-blocking */ }
                 }
 
-                if (action === 'dispatch_agent' && msg.body.agentId) {
+                // Always reset agent lock at end of pipeline processing
+                if (msg.body.agentId) {
                     await resetAgentStatus(env, msg.body.agentId);
                 }
 
@@ -1918,10 +2905,11 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     } catch (_) { /* non-blocking */ }
                 }
 
-                if (msg.body.action === 'dispatch_agent' && msg.body.agentId) {
+                // Always reset agent lock on error (not just dispatch_agent)
+                if (msg.body.agentId) {
                     try {
                         const { patchRow: pr } = await import('./utils/supabase');
-                        await pr(env, 'agents', { status: 'active' }, 'id', msg.body.agentId);
+                        await pr(env, 'agents', { status: 'active', active_pipelines: 0 }, 'id', msg.body.agentId);
                     } catch (e) { /* non-blocking */ }
                 }
                 msg.retry();
@@ -1938,36 +2926,70 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
         try {
             // 0. Clean up stale agents (running >5 min) from previous runs
-            const staleCleanupUrl = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.running&last_activity=lt.${new Date(Date.now() - 5 * 60 * 1000).toISOString()}&select=id,name`;
-            const staleRes = await fetch(staleCleanupUrl, {
-                headers: {
-                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
-                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-                    'Content-Type': 'application/json',
-                },
-            });
-            const staleAgents = staleRes.ok ? await staleRes.json() as { id: number; name: string }[] : [];
-            if (staleAgents.length > 0) {
-                const staleIds = staleAgents.map(a => a.id);
-                console.log(`🧹 Resetting ${staleAgents.length} stale agents: ${staleAgents.map(a => `#${a.id}`).join(', ')}`);
-                const resetUrl = `${env.SUPABASE_URL}/rest/v1/agents?id=in.(${staleIds.join(',')})`;
-                await fetch(resetUrl, {
-                    method: 'PATCH',
-                    headers: {
-                        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
-                        'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-                        'Content-Type': 'application/json',
-                        'Prefer': 'return=minimal',
-                    },
-                    body: JSON.stringify({ status: 'active' }),
-                });
+            try {
+                const { createClient } = await import('@supabase/supabase-js');
+                const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
+                
+                const staleThreshold = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+                const { data: staleAgents, error: fetchErr } = await supabase
+                    .from('agents')
+                    .select('id, name')
+                    .eq('status', 'running')
+                    .lt('last_activity', staleThreshold);
+                    
+                if (fetchErr) {
+                    console.error('❌ Failed to fetch stale agents:', fetchErr);
+                } else if (staleAgents && staleAgents.length > 0) {
+                    const staleIds = staleAgents.map(a => a.id);
+                    console.log(`🧹 Resetting ${staleAgents.length} stale agents: ${staleAgents.map(a => `#${a.id}`).join(', ')}`);
+                    
+                    const { error: resetErr } = await supabase
+                        .from('agents')
+                        .update({ status: 'active', active_pipelines: 0, last_activity: new Date().toISOString() })
+                        .in('id', staleIds);
+                        
+                    if (resetErr) {
+                        console.error('❌ Failed to reset stale agents:', resetErr);
+                    }
+                }
+            } catch (cleanupErr) {
+                console.error('❌ Stale agent cleanup threw an error:', cleanupErr);
             }
 
-            // 1. Run territory briefings generator first
-            await generateTerritoryBriefings(env);
+            // 0b. Bulk-reset any agents with stale pipeline locks (active_pipelines > 0)
+            try {
+                const lockResetRes = await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0&select=id`,
+                    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                );
+                if (lockResetRes.ok) {
+                    const lockedAgents = await lockResetRes.json() as any[];
+                    if (lockedAgents.length > 0) {
+                        await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0`,
+                            {
+                                method: 'PATCH',
+                                headers: {
+                                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                    'Content-Type': 'application/json',
+                                    Prefer: 'return=minimal',
+                                },
+                                body: JSON.stringify({ active_pipelines: 0 }),
+                            }
+                        );
+                        console.log(`🔓 CRON: Auto-reset ${lockedAgents.length} stale agent pipeline locks`);
+                    }
+                }
+            } catch (lockErr) {
+                console.warn('⚠️ Pipeline lock reset failed (non-blocking):', lockErr);
+            }
 
-            // 2. Fetch all active agents that have a schedule != 'manual'
-            const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=*`;
+            // 1. Queue all active territory briefings to run asynchronously
+            await queueTerritoryBriefings(env);
+
+            // 2. Fetch up to 50 active agents that haven't run recently (staggered load balancing)
+            const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=id,name,persona&order=last_activity.asc.nullsfirst&limit=50`;
             const res = await fetch(url, {
                 method: 'GET',
                 headers: {
@@ -1979,22 +3001,36 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
             });
             const agents = res.ok ? await res.json() as any[] : [];
 
-            console.log(`📡 Cron found ${agents.length} active scheduled agents`);
+            console.log(`📡 Cron dispatching batched stagger of ${agents.length} active scheduled agents`);
 
-            for (const agent of agents) {
-                // Dispatch each agent immediately via its own queue message
-                if (env.STRIKE_QUEUE) {
-                    const { patchRow } = await import('./utils/supabase');
-                    await patchRow(env, 'agents', { status: 'running' }, 'id', agent.id);
+            if (agents.length > 0 && env.STRIKE_QUEUE) {
+                const agentIds = agents.map(a => a.id);
+                
+                // Bulk update all 50 agents to 'running' instantly in a single query
+                await fetch(`${env.SUPABASE_URL}/rest/v1/agents?id=in.(${agentIds.join(',')})`, {
+                    method: 'PATCH',
+                    headers: {
+                        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                        'Content-Type': 'application/json',
+                        Prefer: 'return=minimal',
+                    },
+                    body: JSON.stringify({ status: 'running' }),
+                });
 
-                    await env.STRIKE_QUEUE.send({
+                // Prepare up to 50 messages for instantaneous batch queueing
+                const messages = agents.map(agent => ({
+                    body: {
                         campaignId: 0,
                         persona: agent.persona || "Rob O'Neill",
                         action: 'dispatch_agent',
                         agentId: agent.id,
-                    });
-                    console.log(`📤 Queued auto-dispatch for Agent #${agent.id} (${agent.name})`);
-                }
+                    }
+                }));
+
+                // Dispatch entire batch to Cloudflare Queue in 1 HTTP limit sequence
+                await env.STRIKE_QUEUE.sendBatch(messages);
+                console.log(`📤 Bulk-queued auto-dispatch for Agents: ${agentIds.join(', ')}`);
             }
 
             // 3. Run additional free sources in parallel (non-blocking)
@@ -2002,6 +3038,9 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
             // 4. Auto-run saved search missions (frequency = 'daily')
             ctx.waitUntil(runSavedSearchMissions(env));
+            
+            // 5. Archive and purge old error logs to R2
+            ctx.waitUntil(archiveOldErrorLogs(env));
 
             console.log(`✅ Cron complete: ${agents.length} agents dispatched + additional sources + missions launched`);
         } catch (error) {
@@ -2100,58 +3139,120 @@ async function runSavedSearchMissions(env: Env): Promise<void> {
 
         console.log(`🎯 Found ${searches.length} daily search missions to dispatch`);
 
-        for (const search of searches) {
-            try {
-                const territoryName = search.territories?.name || 'Unknown Territory';
+        if (searches.length > 0 && env.STRIKE_QUEUE) {
+            // 1. Bulk insert pipeline_runs
+            const pipelineRunPayloads = searches.map(search => ({
+                run_type: 'search_mission',
+                agent_name: `Mission: ${search.name}`,
+                status: 'running',
+                triggered_by: 'cron',
+                metadata: {
+                    mission_id: search.id,
+                    mission_name: search.name,
+                    territory_id: search.territory_id,
+                    territory_name: search.territories?.name || 'Unknown Territory',
+                    query: search.exa_query,
+                },
+                started_at: new Date().toISOString(),
+            }));
 
-                // Create a pipeline_runs record for this mission
-                const { insertRow, patchRow } = await import('./utils/supabase');
-                const runRes = await insertRow(env, 'pipeline_runs', {
-                    run_type: 'search_mission',
-                    agent_name: `Mission: ${search.name}`,
-                    status: 'running',
-                    triggered_by: 'cron',
-                    metadata: {
-                        mission_id: search.id,
-                        mission_name: search.name,
-                        territory_id: search.territory_id,
-                        territory_name: territoryName,
-                        query: search.exa_query,
-                    },
-                    started_at: new Date().toISOString(),
-                });
+            const runsRes = await fetch(`${env.SUPABASE_URL}/rest/v1/pipeline_runs?select=id`, {
+                method: 'POST',
+                headers: {
+                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                    Prefer: 'return=representation',
+                },
+                body: JSON.stringify(pipelineRunPayloads),
+            });
 
-                const runId = runRes.data?.[0]?.id;
+            const runsData = runsRes.ok ? await runsRes.json() as any[] : [];
 
-                // Dispatch the mission to the queue with metadata
-                if (env.STRIKE_QUEUE) {
-                    await env.STRIKE_QUEUE.send({
-                        campaignId: 0,
-                        persona: "Rob O'Neill",
-                        action: 'search_mission',
-                        searchQuery: search.exa_query,
-                        maxResults: 5,
-                        runId,
-                        // Mission metadata — carried through to strikes
-                        missionId: search.id,
-                        missionName: search.name,
-                        territoryId: search.territory_id,
-                        territoryName: territoryName,
-                    });
-                    console.log(`📤 Dispatched mission: "${search.name}" (territory: ${territoryName})`);
+            // 2. Prepare batch queue messages
+            const messages = searches.map((search, i) => ({
+                body: {
+                    campaignId: 0,
+                    persona: "Rob O'Neill",
+                    action: 'search_mission',
+                    searchQuery: search.exa_query,
+                    maxResults: 5,
+                    runId: runsData[i]?.id,
+                    missionId: search.id,
+                    missionName: search.name,
+                    territoryId: search.territory_id,
+                    territoryName: search.territories?.name || 'Unknown Territory',
                 }
+            }));
 
-                // Update last_run_at
-                await patchRow(env, 'saved_searches', {
-                    last_run_at: new Date().toISOString(),
-                }, 'id', search.id);
-            } catch (missionErr) {
-                console.warn(`⚠️ Failed to dispatch mission "${search.name}":`, missionErr);
-            }
+            // 3. Batch dispatch to Queue
+            await env.STRIKE_QUEUE.sendBatch(messages);
+
+            // 4. Bulk Patch last_run_at state
+            const searchIds = searches.map(s => s.id);
+            await fetch(`${env.SUPABASE_URL}/rest/v1/saved_searches?id=in.(${searchIds.join(',')})`, {
+                method: 'PATCH',
+                headers: {
+                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                    Prefer: 'return=minimal',
+                },
+                body: JSON.stringify({ last_run_at: new Date().toISOString() }),
+            });
+
+            console.log(`✅ Bulk-dispatched ${searches.length} search missions instantly`);
         }
-
-        console.log(`✅ Dispatched ${searches.length} search missions`);
     } catch (err) {
         console.error('❌ Saved search missions error:', err);
+    }
+}
+
+/**
+ * ── Archival: Backup and Purge Error Logs ─────────────────────────────
+ * Exports gemini_error_logs older than 5 days as a JSONL file to Cloudflare R2
+ * and then deletes them from PostgreSQL to preserve audit trails while saving DB space.
+ */
+async function archiveOldErrorLogs(env: Env): Promise<void> {
+    try {
+        if (!env.CRM_ATTACHMENTS) return; // R2 binding required
+        
+        const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+        const url = `${env.SUPABASE_URL}/rest/v1/gemini_error_logs?created_at=lt.${encodeURIComponent(fiveDaysAgo)}&select=*`;
+        
+        const res = await fetch(url, {
+            headers: {
+                apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`
+            }
+        });
+        
+        if (!res.ok) return;
+        const oldLogs = await res.json() as any[];
+        
+        if (oldLogs && oldLogs.length > 0) {
+            // Convert to JSONL format
+            const jsonlContent = oldLogs.map(log => JSON.stringify(log)).join('\n');
+            const fileName = `audit_logs/gemini_errors_${new Date().toISOString().split('T')[0]}_backup.jsonl`;
+            
+            // Upload to R2
+            await env.CRM_ATTACHMENTS.put(fileName, jsonlContent, {
+                httpMetadata: { contentType: 'application/x-ndjson' }
+            });
+            console.log(`🗄️ Archived ${oldLogs.length} error logs to R2: ${fileName}`);
+            
+            // Purge the archived logs from Supabase
+            const deleteUrl = `${env.SUPABASE_URL}/rest/v1/gemini_error_logs?created_at=lt.${encodeURIComponent(fiveDaysAgo)}`;
+            await fetch(deleteUrl, {
+                method: 'DELETE',
+                headers: {
+                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`
+                }
+            });
+            console.log(`🧹 Purged ${oldLogs.length} archived error logs from Postgres`);
+        }
+    } catch (e) {
+        console.error('❌ Error archiving old logs:', e);
     }
 }

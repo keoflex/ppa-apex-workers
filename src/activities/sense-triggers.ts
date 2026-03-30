@@ -4,6 +4,7 @@
  * Uses native fetch — no Node.js built-ins.
  */
 import type { Env } from '../index';
+import { fetchRow, patchRow } from '../utils/supabase';
 
 export interface MarketTrigger {
     triggerId: string;
@@ -52,7 +53,8 @@ const EXA_QUERIES = [
     `"IPO" OR "SPAC" OR "public offering" OR "regulatory approval" financial institution ${CURRENT_YEAR}`,
 ] as const;
 
-import { GEMINI_REST_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { logGeminiError } from '../utils/gemini-logger';
 
 // ---------------------------------------------------------------------------
 // Extracted Data Type
@@ -178,7 +180,8 @@ Respond with ONLY a JSON array:
 
     let extractedData: ExtractedMeta[] = [];
     try {
-        const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+        const geminiRes = await fetchGemini(env, 'lite', {
+            activityName: 'sense-triggers',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -187,6 +190,20 @@ Respond with ONLY a JSON array:
                 generationConfig: {
                     temperature: 0.1,
                     responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "ARRAY",
+                        description: "List of extracted companies and executives from news.",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                index: { type: "INTEGER", description: "The [Item X] index number from the prompt" },
+                                company: { type: "STRING", description: "Primary company involved in the event" },
+                                executiveName: { type: "STRING", description: "Highest ranking executive name, or 'Unknown' if none" },
+                                executiveTitle: { type: "STRING" }
+                            },
+                            required: ["index", "company", "executiveName", "executiveTitle"]
+                        }
+                    }
                 },
             }),
         });
@@ -205,6 +222,7 @@ Respond with ONLY a JSON array:
         }
     } catch (err) {
         console.error('❌ Gemini extraction failed:', err);
+        await logGeminiError(env, 'lite-trigger-extraction', 'sense-triggers', err, { itemsCount: filteredResults.length });
         return []; // Fail safe, don't generate garbage triggers
     }
 
@@ -243,7 +261,7 @@ Respond with ONLY a JSON array:
     return top;
 }
 
-export async function senseTriggersForAgent(env: Env, agent: any): Promise<MarketTrigger[]> {
+export async function senseTriggersForAgent(env: Env, agent: any, runId?: string): Promise<MarketTrigger[]> {
     console.log(`🔍 Sensing market triggers for custom agent: ${agent.name} (#${agent.id})...`);
 
     const triggers: MarketTrigger[] = [];
@@ -286,12 +304,27 @@ export async function senseTriggersForAgent(env: Env, agent: any): Promise<Marke
 
         if (!res.ok) {
             const errBody = await res.text();
-            if (res.status === 402) {
-                console.error(`🚨 Exa.ai CREDITS EXHAUSTED for Agent #${agent.id} — top up at dashboard.exa.ai`);
+            if (res.status === 402 || res.status === 429) {
+                console.error(`🚨 Exa.ai CREDITS EXHAUSTED (${res.status}) for Agent #${agent.id}`);
+                if (runId) {
+                    try {
+                        const rows = await fetchRow(env, 'pipeline_runs', 'id', runId);
+                        const existingMeta = rows?.[0]?.metadata || {};
+                        await patchRow(env, 'pipeline_runs', { metadata: { ...existingMeta, exa_status: 'credits_exhausted', exa_error_code: res.status } }, 'id', runId);
+                    } catch(e) { console.warn('Failed to tag exa bounds', e); }
+                }
             } else {
                 console.warn(`⚠️ Exa custom query failed (${res.status}): ${errBody}`);
             }
             return [];
+        }
+
+        if (runId) {
+            try {
+                const rows = await fetchRow(env, 'pipeline_runs', 'id', runId);
+                const existingMeta = rows?.[0]?.metadata || {};
+                await patchRow(env, 'pipeline_runs', { metadata: { ...existingMeta, exa_status: 'operational' } }, 'id', runId);
+            } catch(e) { console.warn('Failed to tag exa operational', e); }
         }
 
         const data = await res.json() as ExaSearchResponse;
@@ -351,7 +384,8 @@ Respond with ONLY a JSON array:
 
     let extractedData: ExtractedMeta[] = [];
     try {
-        const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+        const geminiRes = await fetchGemini(env, 'lite', {
+            activityName: 'sense-mission',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -360,6 +394,20 @@ Respond with ONLY a JSON array:
                 generationConfig: {
                     temperature: 0.1,
                     responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "ARRAY",
+                        description: "List of extracted companies and executives from news.",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                index: { type: "INTEGER", description: "The [Item X] index number from the prompt" },
+                                company: { type: "STRING", description: "Primary company involved in the event" },
+                                executiveName: { type: "STRING", description: "Highest ranking executive name, or 'Unknown' if none" },
+                                executiveTitle: { type: "STRING" }
+                            },
+                            required: ["index", "company", "executiveName", "executiveTitle"]
+                        }
+                    }
                 },
             }),
         });
@@ -375,6 +423,7 @@ Respond with ONLY a JSON array:
         }
     } catch (err) {
         console.error('❌ Gemini extraction failed:', err);
+        await logGeminiError(env, 'lite-agent-extraction', `sense-triggers:agent-${agent.id}`, err, { itemsCount: filteredResults.length });
         return [];
     }
 

@@ -18,16 +18,24 @@ ENVIRONMENT = "development"
 # APOLLO_API_KEY
 # SMARTLEAD_API_KEY
 # WORKER_SECRET
+# AWS_ACCESS_KEY_ID
+# AWS_SECRET_ACCESS_KEY
+# AWS_REGION
+# SES_CONFIGURATION_SET (optional — for open/click tracking)
 
-# ── Durable Objects ──
-[durable_objects]
-bindings = [
-  { name = "HITL_GATE", class_name = "HitlGateDurableObject" }
-]
+# ── Durable Objects (Deprecated) ──
+# [durable_objects]
+# bindings = [
+#   { name = "HITL_GATE", class_name = "HitlGateDurableObject" }
+# ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["HitlGateDurableObject"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["HitlGateDurableObject"]
 
 # ── Queues ──
 [[queues.producers]]
@@ -38,11 +46,11 @@ binding = "STRIKE_QUEUE"
 queue = "strike-pipeline"
 max_batch_size = 10
 max_batch_timeout = 30
+max_concurrency = 50
 
-# ── Cron Triggers ──
-# 9 AM EST (14:00 UTC) + 3 PM EST (20:00 UTC) Mon-Fri — market sensing
+# Every 30 minutes, 24/7/365
 [triggers]
-crons = ["0 14 * * 1-5", "0 20 * * 1-5"]
+crons = ["*/30 * * * *"]
 
 # ── R2 Storage ──
 [[r2_buckets]]

@@ -167,3 +167,35 @@ export async function fetchRows(
         return [];
     }
 }
+
+/**
+ * FETCH rows from a Supabase table where a column matches any value in an array.
+ * Uses PostgREST "in" operator.
+ */
+export async function fetchRowsIn(
+    env: SupabaseEnv,
+    table: string,
+    filterColumn: string,
+    filterValues: string[]
+): Promise<any[]> {
+    if (!filterValues || filterValues.length === 0) return [];
+    
+    // PostgREST "in" operator requires double quotes if strings contain commas.
+    const inArgs = filterValues.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
+    const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filterColumn}=in.(${encodeURIComponent(inArgs)})&select=*`;
+    
+    try {
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: headers(env),
+        });
+        if (!res.ok) {
+            console.error(`[supabase] FETCH IN ${table} failed (${res.status})`);
+            return [];
+        }
+        return await res.json() as any[];
+    } catch (err) {
+        console.error(`[supabase] FETCH IN ${table} exception:`, err);
+        return [];
+    }
+}

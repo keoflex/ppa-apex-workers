@@ -69,7 +69,8 @@ const APOLLO_SEARCH_URL = 'https://api.apollo.io/v1/mixed_people/api_search';
 const APOLLO_BULK_MATCH_URL = 'https://api.apollo.io/v1/people/bulk_match';
 const APOLLO_ORG_ENRICH_URL = 'https://api.apollo.io/v1/organizations/enrich';
 const APOLLO_ORG_SEARCH_URL = 'https://api.apollo.io/v1/mixed_companies/search';
-import { GEMINI_REST_URL as GEMINI_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { logGeminiError } from '../utils/gemini-logger';
 
 function buildFallback(input: EnrichInput): EnrichedLead {
     return {
@@ -99,7 +100,8 @@ async function identifyExecutive(
 
     console.log(`🧠 Asking Gemini: Who leads ${company}?`);
     try {
-        const res = await fetchWithTimeout(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+        const res = await fetchGemini(env, 'lite', {
+            activityName: 'enrich-lead-exec',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -109,7 +111,18 @@ async function identifyExecutive(
                     }],
                 },
                 contents: [{ role: 'user', parts: [{ text: `Who is the current CEO or top executive at ${company}?` }] }],
-                generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+                generationConfig: {
+                    temperature: 0.1,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            name: { type: "STRING", description: "First and last name, or 'Unknown'" },
+                            title: { type: "STRING", description: "The executive's title" }
+                        },
+                        required: ["name", "title"]
+                    }
+                },
             }),
         });
 
@@ -127,6 +140,7 @@ async function identifyExecutive(
         }
     } catch (err) {
         console.warn('⚠️ Gemini executive identification failed:', err);
+        await logGeminiError(env, 'pro-exec-identification', 'enrich-lead', err);
     }
 
     return { name: 'Unknown', title: 'Unknown' };
@@ -248,7 +262,7 @@ async function apolloPeopleSearch(
         }
 
         // Try to find the target person first
-        let primary = null;
+        let primary: any = null;
         if (targetName && targetName !== 'Unknown') {
             const targetLower = targetName.toLowerCase();
             primary = enrichedPeople.find((p: any) =>
@@ -388,7 +402,7 @@ async function apolloOrgAndPeopleSearch(
                     }
                 }
 
-                let primary = null;
+                let primary: any = null;
                 if (targetName && targetName !== 'Unknown') {
                     const targetLower = targetName.toLowerCase();
                     primary = enrichedPeople.find((p: any) =>
@@ -494,12 +508,31 @@ Reply with ONLY a JSON object:
   "reasoning": "brief explanation of sources/method"
 }`;
 
-        const res = await fetchWithTimeout(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+        const res = await fetchGemini(env, 'lite', {
+            activityName: 'enrich-lead-contact',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.1, maxOutputTokens: 400 },
+                generationConfig: { 
+                    temperature: 0.1, 
+                    maxOutputTokens: 400,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            email: { type: "STRING" },
+                            emailConfidence: { type: "STRING", enum: ["HIGH", "MEDIUM", "LOW", "NONE"] },
+                            phone: { type: "STRING" },
+                            phoneConfidence: { type: "STRING", enum: ["HIGH", "MEDIUM", "LOW", "NONE"] },
+                            linkedinUrl: { type: "STRING" },
+                            twitterUrl: { type: "STRING" },
+                            companyDomain: { type: "STRING" },
+                            reasoning: { type: "STRING" }
+                        },
+                        required: ["email", "emailConfidence", "phone", "phoneConfidence", "linkedinUrl", "twitterUrl", "companyDomain", "reasoning"]
+                    }
+                },
             }),
         });
 
@@ -509,10 +542,7 @@ Reply with ONLY a JSON object:
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
         if (!text) return null;
 
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) return null;
-
-        const parsed = JSON.parse(jsonMatch[0]);
+        const parsed = JSON.parse(text);
 
         // Map Gemini confidence to our system (AI is always lower than verified data)
         const mapConfidence = (level: string) => {
@@ -552,6 +582,7 @@ Reply with ONLY a JSON object:
         return found.length > 0 || result.companyDomain ? result : null;
     } catch (err) {
         console.warn('⚠️ Gemini contact discovery failed:', err);
+        await logGeminiError(env, 'pro-contact-discovery', 'enrich-lead', err);
     }
 
     return null;

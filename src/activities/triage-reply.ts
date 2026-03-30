@@ -58,7 +58,9 @@ function keywordTriage(input: TriageInput): TriageResult {
 // Gemini REST endpoint (JSON mode)
 // ---------------------------------------------------------------------------
 
-import { GEMINI_REST_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { GEMINI_PRO_MODEL } from '../config/gemini';
+import { logGeminiError } from '../utils/gemini-logger';
 
 const VALID_CATEGORIES: TriageCategory[] = [
     'direct_strike',
@@ -103,7 +105,8 @@ ${input.body}
 Classify this reply now.`;
 
     try {
-        const response = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+        const response = await fetchGemini(env, 'pro', {
+            activityName: 'triage-reply',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -120,6 +123,15 @@ Classify this reply now.`;
                     temperature: 0.1,          // Low temperature for consistent classification
                     maxOutputTokens: 256,
                     responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            triage_category: { type: "STRING", enum: ["direct_strike", "info_seekers", "referral_pivot", "not_now"] },
+                            confidence: { type: "NUMBER" },
+                            ai_reasoning: { type: "STRING" }
+                        },
+                        required: ["triage_category", "confidence", "ai_reasoning"]
+                    }
                 },
             }),
         });
@@ -166,13 +178,14 @@ Classify this reply now.`;
             category: parsed.triage_category,
             confidence,
             reasoning,
-            modelUsed: 'gemini-3-flash-preview',
+            modelUsed: GEMINI_PRO_MODEL,
         };
 
         console.log(`✅ Triaged as: ${result.category} (${result.confidence.toFixed(2)} confidence) — Gemini`);
         return result;
     } catch (err) {
         console.error('❌ Gemini triage failed, falling back to keyword matching:', err);
+        await logGeminiError(env, 'pro-triage-reply', 'triage-reply', err);
         return keywordTriage(input);
     }
 }

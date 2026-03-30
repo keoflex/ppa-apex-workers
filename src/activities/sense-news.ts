@@ -5,7 +5,8 @@
  */
 import type { Env } from '../index';
 import type { MarketTrigger } from './sense-triggers';
-import { GEMINI_REST_URL } from '../config/gemini';
+import { fetchGemini } from '../utils/gemini-fetch';
+import { logGeminiError } from '../utils/gemini-logger';
 
 // ---------------------------------------------------------------------------
 // NewsData.io response shape
@@ -156,13 +157,31 @@ Rules:
 
     let extracted: ExtractedMeta[] = [];
     try {
-        const geminiRes = await fetch(`${GEMINI_REST_URL}?key=${env.GEMINI_API_KEY}`, {
+        const geminiRes = await fetchGemini(env, 'lite', {
+            activityName: 'sense-news',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 system_instruction: { parts: [{ text: systemPrompt }] },
                 contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
-                generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+                generationConfig: {
+                    temperature: 0.1,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                index: { type: "INTEGER" },
+                                company: { type: "STRING" },
+                                executiveName: { type: "STRING" },
+                                executiveTitle: { type: "STRING" },
+                                relevanceScore: { type: "INTEGER" }
+                            },
+                            required: ["index", "company", "executiveName", "executiveTitle", "relevanceScore"]
+                        }
+                    }
+                },
             }),
         });
         if (!geminiRes.ok) throw new Error(await geminiRes.text());
@@ -175,6 +194,7 @@ Rules:
         }
     } catch (err) {
         console.error('❌ Gemini news extraction failed:', err);
+        await logGeminiError(env, 'lite-news-extraction', 'sense-news', err, { itemsCount: articles.length });
         return [];
     }
 
