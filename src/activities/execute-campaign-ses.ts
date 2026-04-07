@@ -154,6 +154,7 @@ export async function executeCampaignSes(env: Env, input: SesExecuteInput): Prom
         if (input.campaignId > 0) {
             await patchRow(env, 'strike_campaigns', {
                 status: 'failed',
+                failure_reason: errorMsg,
             }, 'id', input.campaignId);
         }
 

@@ -94,7 +94,7 @@ export async function senseTriggers(env: Env): Promise<MarketTrigger[]> {
                     numResults: 3,
                     type: 'neural',
                     useAutoprompt: true,
-                    startPublishedDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+                    startPublishedDate: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
                     excludeDomains: [
                         'wikipedia.org',
                         'investopedia.com',
@@ -286,7 +286,7 @@ export async function senseTriggersForAgent(env: Env, agent: any, runId?: string
                 numResults: agent.max_leads_per_run || 5, // use configured limit
                 type: 'neural',
                 useAutoprompt: true,
-                startPublishedDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+                startPublishedDate: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
                 excludeDomains: [
                     'wikipedia.org',
                     'investopedia.com',

@@ -94,6 +94,7 @@ export async function executeCampaign(env: Env, input: ExecuteInput): Promise<Ca
         if (input.campaignId > 0) {
             await patchRow(env, 'strike_campaigns', {
                 status: 'failed',
+                failure_reason: errorMsg,
             }, 'id', input.campaignId);
         }
 

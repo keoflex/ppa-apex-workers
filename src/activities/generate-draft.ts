@@ -253,7 +253,7 @@ ${input.steeringNotes}` : ''}`;
                 ],
                 generationConfig: {
                     temperature: 0.85,
-                    maxOutputTokens: 4096,
+                    maxOutputTokens: 8192,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "OBJECT",
@@ -289,7 +289,26 @@ ${input.steeringNotes}` : ''}`;
             throw new Error('Gemini returned an empty response');
         }
 
-        const parsed = JSON.parse(rawText) as { subject?: string; body?: string };
+        let parsed: { subject?: string; body?: string };
+        try {
+            parsed = JSON.parse(rawText) as { subject?: string; body?: string };
+        } catch (parseErr) {
+            // Attempt to repair truncated JSON (Gemini sometimes cuts off mid-string)
+            try {
+                let repaired = rawText.trim();
+                // Close any unclosed strings and braces
+                if (!repaired.endsWith('}')) {
+                    // Count unmatched quotes
+                    const quoteCount = (repaired.match(/(?<!\\)"/g) || []).length;
+                    if (quoteCount % 2 !== 0) repaired += '"';
+                    if (!repaired.endsWith('}')) repaired += '}';
+                }
+                parsed = JSON.parse(repaired);
+                console.warn('⚠️ Repaired truncated Gemini JSON successfully');
+            } catch {
+                throw parseErr; // Original error — let fallback handle it
+            }
+        }
 
         if (!parsed.subject || !parsed.body) {
             throw new Error(`Gemini response missing subject or body fields. Got: ${rawText.slice(0, 200)}`);

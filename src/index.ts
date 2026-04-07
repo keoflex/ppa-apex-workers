@@ -692,6 +692,133 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             }
         }
 
+        // ── SES Event Webhook (SNS → Worker) ──
+        // Receives bounce, complaint, and delivery notifications from Amazon SES via SNS
+        if (url.pathname === '/api/ses-webhook' && request.method === 'POST') {
+            try {
+                const rawBody = await request.text();
+                const payload = JSON.parse(rawBody);
+
+                // Handle SNS subscription confirmation
+                if (payload.Type === 'SubscriptionConfirmation') {
+                    console.log('📬 SNS subscription confirmation received, confirming...');
+                    if (payload.SubscribeURL) {
+                        await fetch(payload.SubscribeURL);
+                        console.log('✅ SNS subscription confirmed');
+                    }
+                    return jsonWithCors({ status: 'subscription_confirmed' });
+                }
+
+                // Handle actual notification
+                if (payload.Type === 'Notification') {
+                    const message = typeof payload.Message === 'string'
+                        ? JSON.parse(payload.Message) : payload.Message;
+
+                    const eventType = message.eventType || message.notificationType;
+                    const mail = message.mail || {};
+                    const sesMessageId = mail.messageId || '';
+
+                    console.log(`📬 SES event: ${eventType} | MessageId: ${sesMessageId}`);
+
+                    if (!sesMessageId) {
+                        return jsonWithCors({ status: 'ignored', reason: 'no messageId' });
+                    }
+
+                    // Find the campaign by SES message ID
+                    const campaignRes = await fetch(
+                        `${env.SUPABASE_URL}/rest/v1/strike_campaigns?ses_message_id=eq.${encodeURIComponent(sesMessageId)}&select=id,status,workflow_id`,
+                        {
+                            headers: {
+                                'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                                'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                            },
+                        }
+                    );
+
+                    if (!campaignRes.ok) {
+                        console.error(`[ses-webhook] Supabase lookup failed: ${campaignRes.status}`);
+                        return jsonWithCors({ status: 'error', reason: 'db_lookup_failed' }, { status: 500 });
+                    }
+
+                    const campaigns = await campaignRes.json() as any[];
+                    if (campaigns.length === 0) {
+                        console.log(`[ses-webhook] No campaign found for MessageId: ${sesMessageId}`);
+                        return jsonWithCors({ status: 'ignored', reason: 'campaign_not_found' });
+                    }
+
+                    const campaign = campaigns[0];
+                    const now = new Date().toISOString();
+                    const updateData: Record<string, any> = {};
+
+                    if (eventType === 'Bounce') {
+                        const bounce = message.bounce || {};
+                        const bounceType = bounce.bounceType === 'Permanent' ? 'hard_bounce' : 'soft_bounce';
+                        const bouncedRecipients = (bounce.bouncedRecipients || [])
+                            .map((r: any) => `${r.emailAddress}: ${r.diagnosticCode || r.status || 'unknown'}`)
+                            .join('; ');
+
+                        updateData.status = 'failed';
+                        updateData.bounced_at = now;
+                        updateData.bounce_type = bounceType;
+                        console.log(`🚫 BOUNCE (${bounceType}) for campaign #${campaign.id}: ${bouncedRecipients}`);
+
+                    } else if (eventType === 'Complaint') {
+                        const complaint = message.complaint || {};
+                        updateData.status = 'failed';
+                        updateData.bounced_at = now;
+                        updateData.bounce_type = 'complaint';
+                        console.log(`⚠️ COMPLAINT for campaign #${campaign.id}: ${complaint.complaintFeedbackType || 'unknown'}`);
+
+                    } else if (eventType === 'Delivery') {
+                        updateData.delivered_at = now;
+                        console.log(`✅ DELIVERED campaign #${campaign.id}`);
+
+                    } else if (eventType === 'Open') {
+                        updateData.opened_at = now;
+                        console.log(`👁️ OPENED campaign #${campaign.id}`);
+
+                    } else if (eventType === 'Click') {
+                        updateData.clicked_at = now;
+                        console.log(`🔗 CLICKED campaign #${campaign.id}`);
+
+                    } else {
+                        console.log(`[ses-webhook] Unhandled event type: ${eventType}`);
+                        return jsonWithCors({ status: 'ignored', reason: `unhandled_event: ${eventType}` });
+                    }
+
+                    // Update the campaign
+                    if (Object.keys(updateData).length > 0) {
+                        const patchRes = await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=eq.${campaign.id}`,
+                            {
+                                method: 'PATCH',
+                                headers: {
+                                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                    'Content-Type': 'application/json',
+                                    'Prefer': 'return=minimal',
+                                },
+                                body: JSON.stringify(updateData),
+                            }
+                        );
+
+                        if (!patchRes.ok) {
+                            console.error(`[ses-webhook] Failed to update campaign #${campaign.id}: ${patchRes.status}`);
+                        } else {
+                            console.log(`💾 Campaign #${campaign.id} updated: ${JSON.stringify(updateData)}`);
+                        }
+                    }
+
+                    return jsonWithCors({ status: 'processed', eventType, campaignId: campaign.id });
+                }
+
+                return jsonWithCors({ status: 'ignored', reason: 'unknown_type' });
+            } catch (error) {
+                console.error('[ses-webhook] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // Execute delivery (called by Next.js approve endpoint)
         if (url.pathname === '/api/execute' && request.method === 'POST') {
             try {
@@ -1853,6 +1980,19 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             const subject = mailContent.commonHeaders?.subject || mailContent.subject || '(no subject)';
                             const replyBody = message.content || mailContent.content || '';
 
+                            // Filter out automated bounces and delivery failures from hitting the Triage Inbox
+                            const lowerSubject = subject.toLowerCase();
+                            const isBounce = senderEmail.toLowerCase().startsWith('mailer-daemon') ||
+                                             senderEmail.toLowerCase().startsWith('postmaster') ||
+                                             lowerSubject.includes('delivery status notification') ||
+                                             lowerSubject.includes('undeliverable') ||
+                                             lowerSubject.includes('returned mail');
+                            
+                            if (isBounce) {
+                                console.log(`🛑 Ignoring automated bounce in Triage Inbox: ${subject} from ${senderEmail}`);
+                                return;
+                            }
+
                             // Try to match to originating campaign via In-Reply-To header or subject
                             let campaignId = 0;
                             const inReplyTo = mailContent.commonHeaders?.inReplyTo || '';
@@ -2510,13 +2650,26 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
                     triggers = await senseTriggersForAgent(env, agent, msg.body.runId);
 
-                    if (triggers.length === 0) {
-                        // Exa returned nothing — try secondary sources as fallback
-                        console.log(`⚠️ Exa returned 0 for Agent #${agent.id}, trying secondary sources...`);
+                    // Quick deduplication to see if Exa found anything genuinely new
+                    let hasNewExaTriggers = false;
+                    if (triggers.length > 0) {
+                        const companyNames = triggers.map(t => t.company).filter(Boolean);
+                        if (companyNames.length > 0) {
+                            const { fetchRowsIn } = await import('./utils/supabase');
+                            const existingRows = await fetchRowsIn(env, 'lead_targets', 'company', companyNames);
+                            const existingCompanies = new Set(existingRows.map((r: any) => r.company));
+                            hasNewExaTriggers = triggers.some(t => !existingCompanies.has(t.company));
+                        } else {
+                            hasNewExaTriggers = true;
+                        }
+                    }
+
+                    if (!hasNewExaTriggers) {
+                        console.log(`⚠️ Exa returned 0 new leads for Agent #${agent.id}, trying secondary sources...`);
                         const [secResult, courtResult, newsResult] = await Promise.allSettled([
-                            senseSecFilings(env),
-                            senseCourtFilings(env),
-                            senseNews(env),
+                            senseSecFilingsForQuery(env, agent.exa_query || agent.name),
+                            senseCourtFilingsForQuery(env, agent.exa_query || agent.name),
+                            senseNewsForQuery(env, agent.exa_query || agent.name),
                         ]);
                         const fallbackTriggers: MarketTrigger[] = [];
                         const sourceStatus: Record<string, string> = {};
