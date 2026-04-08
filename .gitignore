@@ -3,3 +3,5 @@ dist/
 .dev.vars
 .wrangler/
 \n# Local debug scripts\nforce_send_stuck.ts\ntest-ses.ts
+force_send_stuck.ts
+test-ses.ts
