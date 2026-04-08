@@ -822,7 +822,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
         // Execute delivery (called by Next.js approve endpoint)
         if (url.pathname === '/api/execute' && request.method === 'POST') {
             try {
-                const body = await request.json() as { workflowId: string; action: string; senderAccounts?: string[] };
+                const body = await request.json() as { workflowId: string; action: string; senderAccounts?: string[]; forceInline?: boolean };
 
                 // Look up the strike campaign from Supabase to get email content + recipient
                 const campaignRows = await fetchRow(env, 'strike_campaigns', 'workflow_id', body.workflowId);
@@ -850,7 +850,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                 const senderEmail = body.senderAccounts?.[0] || 'fred@polsinellimgmt.com';
 
                 // Queue the delivery via STRIKE_QUEUE for throttled sending
-                if (env.STRIKE_QUEUE) {
+                if (env.STRIKE_QUEUE && !body.forceInline) {
                     await env.STRIKE_QUEUE.send({
                         action: 'deliver',
                         campaignId: Number(campaign.id) || 0,
@@ -862,12 +862,27 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         senderName: 'Fred Posinelli',
                     });
                     console.log(`📤 Queued throttled delivery for Workflow #${body.workflowId}`);
+                    return Response.json({ status: 'queued', message: 'Delivery queued for throttled sending' });
                 } else {
-                    console.warn(`⚠️ STRIKE_QUEUE not bound, unable to queue delivery for Workflow #${body.workflowId}`);
-                    return Response.json({ error: 'System configuration error: STRIKE_QUEUE not bound' }, { status: 500 });
+                    if (!env.STRIKE_QUEUE) console.warn(`⚠️ STRIKE_QUEUE not bound, unable to queue delivery for Workflow #${body.workflowId}`);
+                    console.log(`🚀 Forcing inline delivery for Workflow #${body.workflowId}...`);
+                    try {
+                        const { executeCampaignSes } = await import('./activities/execute-campaign-ses');
+                        const result = await executeCampaignSes(env, {
+                            campaignId: Number(campaign.id) || 0,
+                            workflowId: body.workflowId,
+                            emailSubject: campaign.email_subject || `Introduction — ${campaign.workflow_id}`,
+                            emailBody: campaign.drafted_body || campaign.email_body || '',
+                            recipientEmail,
+                            senderEmail,
+                            senderName: 'Fred Posinelli',
+                        });
+                        return Response.json({ status: 'inline_delivered', result });
+                    } catch (e) {
+                         console.error('❌ Inline SES execution failed:', e);
+                         return Response.json({ error: `Inline delivery failed: ${e}` }, { status: 500 });
+                    }
                 }
-
-                return Response.json({ status: 'queued', message: 'Delivery queued for throttled sending' });
             } catch (error) {
                 return Response.json({ error: String(error) }, { status: 500 });
             }
@@ -1978,7 +1993,44 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             const senderEmail = fromMatch?.[2] || fromHeader;
                             const senderCompany = senderEmail.split('@')[1]?.split('.')[0] || 'Unknown';
                             const subject = mailContent.commonHeaders?.subject || mailContent.subject || '(no subject)';
-                            const replyBody = message.content || mailContent.content || '';
+                            let replyBody = message.content || mailContent.content || '';
+
+                            // Decode base64 Raw format if it comes from SES (Raw format is base64 encoded by SNS)
+                            if (replyBody && /^[A-Za-z0-9+/=\s]+$/.test(replyBody) && replyBody.length > 20) {
+                                try {
+                                    // Use TextDecoder for proper UTF-8 handling from base64
+                                    const rawStr = atob(replyBody.replace(/\s+/g, ''));
+                                    const bytes = new Uint8Array(rawStr.length);
+                                    for (let i = 0; i < rawStr.length; i++) bytes[i] = rawStr.charCodeAt(i);
+                                    const decoded = new TextDecoder('utf-8').decode(bytes);
+                                    
+                                    // Simple extraction of the plain text part if it's multipart MIME
+                                    const textPlainIndex = decoded.indexOf('Content-Type: text/plain');
+                                    if (textPlainIndex !== -1) {
+                                        let start = decoded.indexOf('\r\n\r\n', textPlainIndex);
+                                        if (start === -1) start = decoded.indexOf('\n\n', textPlainIndex);
+                                        start = start !== -1 ? start + (decoded[start] === '\r' ? 4 : 2) : textPlainIndex + 30;
+                                        
+                                        let textChunk = decoded.substring(start);
+                                        const boundaryMatch = decoded.match(/boundary="?([^"\r\n]+)"?/);
+                                        if (boundaryMatch) {
+                                            const boundaryIndex = textChunk.indexOf('--' + boundaryMatch[1]);
+                                            if (boundaryIndex !== -1) textChunk = textChunk.substring(0, boundaryIndex);
+                                        }
+                                        replyBody = textChunk.trim();
+                                    } else {
+                                        // Not clearly tagged, strip standard headers block
+                                        const doubleNewline = decoded.indexOf('\r\n\r\n');
+                                        if (doubleNewline !== -1 && doubleNewline < 3000) {
+                                            replyBody = decoded.substring(doubleNewline + 4).trim();
+                                        } else {
+                                            replyBody = decoded.trim();
+                                        }
+                                    }
+                                } catch (err) {
+                                    console.warn('⚠️ Failed to decode SES base64 message content', err);
+                                }
+                            }
 
                             // Filter out automated bounces and delivery failures from hitting the Triage Inbox
                             const lowerSubject = subject.toLowerCase();

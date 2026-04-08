@@ -24,7 +24,7 @@ export async function fetchGemini(
     tier: 'lite' | 'pro',
     init: GeminiFetchOptions
 ): Promise<Response> {
-    const timeoutMs = init.timeoutMs || 60000; // Increased default timeout to 60s for massive SEC context windows
+    const timeoutMs = init.timeoutMs || 120000; // Increased default timeout to 120s for massive SEC context windows
     const maxRetries = init.maxRetries ?? 2;
     const activityName = init.activityName || 'fetchGemini';
 

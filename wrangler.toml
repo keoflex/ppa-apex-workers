@@ -9,6 +9,7 @@ account_id = "78ea385b814960bac401db0341907944"
 # ── Environment Variables ──
 [vars]
 ENVIRONMENT = "development"
+SES_CONFIGURATION_SET = "my-first-configuration-set"
 
 # Secrets (set via `wrangler secret put`):
 # SUPABASE_URL

@@ -155,11 +155,19 @@ Classify this reply now.`;
             throw new Error('Gemini returned an empty response');
         }
 
-        const parsed = JSON.parse(rawText) as {
-            triage_category?: unknown;
-            confidence?: unknown;
-            ai_reasoning?: unknown;
-        };
+        // Extract JSON specifically to ignore conversational prefixes like "Here is the JSON..." 
+        let jsonStr = rawText;
+        const match = rawText.match(/\{[\s\S]*\}/);
+        if (match) {
+            jsonStr = match[0];
+        }
+
+        let parsed: any;
+        try {
+            parsed = JSON.parse(jsonStr);
+        } catch (e) {
+            throw new Error(`Failed to parse Gemini output as JSON: ${e}. Raw output: ${rawText.substring(0, 50)}...`);
+        }
 
         // Validate the category is strictly one of our enum values
         if (!isValidCategory(parsed.triage_category)) {
