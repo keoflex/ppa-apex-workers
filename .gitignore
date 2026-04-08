@@ -2,3 +2,4 @@ node_modules/
 dist/
 .dev.vars
 .wrangler/
+\n# Local debug scripts\nforce_send_stuck.ts\ntest-ses.ts
