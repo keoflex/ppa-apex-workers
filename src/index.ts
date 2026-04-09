@@ -2676,28 +2676,41 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     });
                     const caRows = caRes.ok ? await caRes.json() as any[] : [];
 
+                    let agentCampaigns: Array<{ id: number, objective?: string, partners: any[] }> = [];
+
                     if (caRows.length > 0) {
-                        // Use first campaign assignment for this run
+                        // Use first campaign assignment for legacy fallback
                         strategicCampaignId = caRows[0].campaign_id;
 
-                        // Fetch all partners for this campaign via campaign_partners
-                        const cpUrl = `${env.SUPABASE_URL}/rest/v1/campaign_partners?campaign_id=eq.${strategicCampaignId}&select=company_id`;
-                        const cpRes = await fetch(cpUrl, {
-                            headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
-                        });
-                        const cpRows = cpRes.ok ? await cpRes.json() as any[] : [];
-                        for (const cp of cpRows) {
-                            const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
-                            if (pRows && pRows.length > 0) partnerProfiles.push(pRows[0]);
+                        const { fetchRow } = await import('./utils/supabase');
+
+                        for (const row of caRows) {
+                            const cid = row.campaign_id;
+                            let obj = undefined;
+                            let partners: any[] = [];
+
+                            // Fetch all partners for this campaign via campaign_partners
+                            const cpUrl = `${env.SUPABASE_URL}/rest/v1/campaign_partners?campaign_id=eq.${cid}&select=company_id`;
+                            const cpRes = await fetch(cpUrl, {
+                                headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
+                            });
+                            const cpRows = cpRes.ok ? await cpRes.json() as any[] : [];
+                            for (const cp of cpRows) {
+                                const pRows = await fetchRow(env, 'crm_companies', 'id', cp.company_id);
+                                if (pRows && pRows.length > 0) partners.push(pRows[0]);
+                            }
+
+                            // Fetch the campaign objective
+                            const campRows = await fetchRow(env, 'campaigns', 'id', cid);
+                            if (campRows && campRows.length > 0) obj = campRows[0].objective || undefined;
+
+                            agentCampaigns.push({ id: cid, objective: obj, partners });
+
+                            // Populate legacy partnerProfiles with all partners from all campaigns just in case something else relies on it
+                            partnerProfiles.push(...partners);
                         }
 
-                        // Fetch the campaign objective
-                        if (strategicCampaignId) {
-                            const campRows = await fetchRow(env, 'campaigns', 'id', strategicCampaignId);
-                            if (campRows && campRows.length > 0) campaignObjective = campRows[0].objective || undefined;
-                        }
-
-                        console.log(`📋 Agent #${msg.body.agentId} → Campaign ${strategicCampaignId} with ${partnerProfiles.length} partners`);
+                        console.log(`📋 Agent #${msg.body.agentId} → mapped to ${agentCampaigns.length} campaigns for round-robin dispatch.`);
                     }
 
                     triggers = await senseTriggersForAgent(env, agent, msg.body.runId);
@@ -2948,6 +2961,20 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             }
                         }
 
+                        // Round Robin logic for campaigns
+                        let targetCampaignObj = campaignObjective;
+                        let targetPartnerProfiles = partnerProfiles;
+                        let targetCampaignId = strategicCampaignId;
+
+                        if (agentCampaigns && agentCampaigns.length > 0 && action === 'dispatch_agent') {
+                            const stringHash = selectedTrigger.company ? selectedTrigger.company.length : Math.floor(Math.random() * 10);
+                            const selectedCamp = agentCampaigns[stringHash % agentCampaigns.length];
+                            targetCampaignId = selectedCamp.id;
+                            targetCampaignObj = selectedCamp.objective;
+                            targetPartnerProfiles = selectedCamp.partners;
+                            console.log(`🎯 Distributing ${selectedTrigger.company} to Campaign #${targetCampaignId}`);
+                        }
+
                         // Step 3: Generate personalized email draft via Gemini
                         let draft = { subject: 'Suppressed Contact', body: `This contact was flagged against the suppression list. Reason: ${suppressionReason || 'Unknown'}` };
                         if (!isSuppressed) {
@@ -2956,8 +2983,8 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                 persona: persona || "Rob O'Neill",
                                 triggerHeadline: selectedTrigger.headline,
                                 triggerArticleText: selectedTrigger.articleText || '',
-                                partnerProfiles,
-                                steeringNotes: campaignObjective || undefined,
+                                partnerProfiles: targetPartnerProfiles,
+                                steeringNotes: targetCampaignObj || undefined,
                             });
                         }
 
@@ -3013,7 +3040,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                 email_subject: draft.subject,
                                 drafted_body: draft.body,
                                 workflow_id: workflowId,
-                                campaign_id: strategicCampaignId,
+                                campaign_id: targetCampaignId,
                                 agent_id: currentAgentId,
                                 ...(isTierOne ? { approved_at: new Date().toISOString() } : {}),
                             });
