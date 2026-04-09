@@ -305,12 +305,13 @@ export async function senseTriggersForAgent(env: Env, agent: any, runId?: string
         if (!res.ok) {
             const errBody = await res.text();
             if (res.status === 402 || res.status === 429) {
-                console.error(`🚨 Exa.ai CREDITS EXHAUSTED (${res.status}) for Agent #${agent.id}`);
+                const exaStatus = res.status === 402 ? 'credits_exhausted' : 'rate_limited';
+                console.error(`🚨 Exa.ai ${res.status === 402 ? 'CREDITS EXHAUSTED' : 'RATE LIMITED'} (${res.status}) for Agent #${agent.id}`);
                 if (runId) {
                     try {
                         const rows = await fetchRow(env, 'pipeline_runs', 'id', runId);
                         const existingMeta = rows?.[0]?.metadata || {};
-                        await patchRow(env, 'pipeline_runs', { metadata: { ...existingMeta, exa_status: 'credits_exhausted', exa_error_code: res.status } }, 'id', runId);
+                        await patchRow(env, 'pipeline_runs', { metadata: { ...existingMeta, exa_status: exaStatus, exa_error_code: res.status } }, 'id', runId);
                     } catch(e) { console.warn('Failed to tag exa bounds', e); }
                 }
             } else {
