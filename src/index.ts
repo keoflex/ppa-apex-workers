@@ -726,7 +726,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
 
                     // Find the campaign by SES message ID
                     const campaignRes = await fetch(
-                        `${env.SUPABASE_URL}/rest/v1/strike_campaigns?ses_message_id=eq.${encodeURIComponent(sesMessageId)}&select=id,status,workflow_id`,
+                        `${env.SUPABASE_URL}/rest/v1/strike_campaigns?ses_message_id=eq.${encodeURIComponent(sesMessageId)}&select=id,status,workflow_id,funnel_id`,
                         {
                             headers: {
                                 'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
@@ -806,6 +806,16 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                             console.error(`[ses-webhook] Failed to update campaign #${campaign.id}: ${patchRes.status}`);
                         } else {
                             console.log(`💾 Campaign #${campaign.id} updated: ${JSON.stringify(updateData)}`);
+                            
+                            // Safety Catch / Kill Switch: Halt Funnel if this is a Bounce or Complaint
+                            if (campaign.funnel_id && (eventType === 'Bounce' || eventType === 'Complaint')) {
+                                await fetch(`${env.SUPABASE_URL}/rest/v1/strike_funnels?id=eq.${campaign.funnel_id}`, {
+                                    method: 'PATCH',
+                                    headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' },
+                                    body: JSON.stringify({ status: eventType === 'Bounce' ? 'halted_bounced' : 'halted_complaint' })
+                                });
+                                console.log(`🛑 Funnel #${campaign.funnel_id} Kill Switch triggered by ${eventType}`);
+                            }
                         }
                     }
 
@@ -2112,6 +2122,13 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                 if (scData?.[0]) {
                                     const currentScore = Number(scData[0].conversion_score) || 0;
                                     await patchRow(env, 'strike_campaigns', { conversion_score: currentScore + 5 }, 'id', campaignId);
+                                    
+                                    // Kill Switch: Reply received, halt all future sequence steps
+                                    if (scData[0].funnel_id) {
+                                        const isOptOut = triageResult.category === 'uninterested' || triageResult.category === 'unsubscribe';
+                                        await patchRow(env, 'strike_funnels', { status: isOptOut ? 'halted_opt_out' : 'halted_replied' }, 'id', scData[0].funnel_id);
+                                        console.log(`🛑 Funnel #${scData[0].funnel_id} Kill Switch triggered by Inbound Reply (Category: ${triageResult.category})`);
+                                    }
                                 }
 
                                 // Auto-detect high intent
@@ -3220,8 +3237,8 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
             // 1. Queue all active territory briefings to run asynchronously
             await queueTerritoryBriefings(env);
 
-            // 2. Fetch up to 50 active agents that haven't run recently (staggered load balancing)
-            const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=id,name,persona&order=last_activity.asc.nullsfirst&limit=50`;
+            // 2. Fetch up to 75 active agents that haven't run recently (staggered load balancing)
+            const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=id,name,persona&order=last_activity.asc.nullsfirst&limit=75`;
             const res = await fetch(url, {
                 method: 'GET',
                 headers: {
@@ -3238,7 +3255,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
             if (agents.length > 0 && env.STRIKE_QUEUE) {
                 const agentIds = agents.map(a => a.id);
                 
-                // Bulk update all 50 agents to 'running' instantly in a single query
+                // Bulk update all 75 agents to 'running' instantly in a single query
                 await fetch(`${env.SUPABASE_URL}/rest/v1/agents?id=in.(${agentIds.join(',')})`, {
                     method: 'PATCH',
                     headers: {
@@ -3250,7 +3267,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     body: JSON.stringify({ status: 'running' }),
                 });
 
-                // Prepare up to 50 messages for instantaneous batch queueing
+                // Prepare up to 75 messages for instantaneous batch queueing
                 const messages = agents.map(agent => ({
                     body: {
                         campaignId: 0,
@@ -3263,6 +3280,56 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 // Dispatch entire batch to Cloudflare Queue in 1 HTTP limit sequence
                 await env.STRIKE_QUEUE.sendBatch(messages);
                 console.log(`📤 Bulk-queued auto-dispatch for Agents: ${agentIds.join(', ')}`);
+            }
+
+            // 2b. Dispatch Scheduled Funnel Sequence Steps
+            const nowIso = new Date().toISOString();
+            const schedUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.scheduled&scheduled_send_at=lte.${nowIso}&select=id,workflow_id,funnel_id,strike_funnels(status)&limit=100`;
+            const schedRes = await fetch(schedUrl, { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } });
+            
+            if (schedRes.ok) {
+                const dueStrikes = await schedRes.json() as any[];
+                if (dueStrikes.length > 0 && env.STRIKE_QUEUE) {
+                    const validIds: number[] = [];
+                    const messagesItems = [];
+
+                    for (const strike of dueStrikes) {
+                        const funnelStatus = strike.strike_funnels?.status || 'active';
+                        // If funnel is active, push it onto the delivery queue
+                        if (funnelStatus === 'active') {
+                            validIds.push(strike.id);
+                            messagesItems.push({
+                                body: {
+                                    campaignId: strike.id,
+                                    workflowId: strike.workflow_id,
+                                    persona: "Rob O'Neill", // Fallback persona, executor handles true persona
+                                    action: 'dispatch',
+                                    forceInline: true // Ensure fast delivery since it's scheduled
+                                }
+                            });
+                        } else {
+                            // Suppress halted funnel strikes so they don't block the queue
+                            await fetch(`${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=eq.${strike.id}`, {
+                                method: 'PATCH',
+                                headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ status: 'suppressed', failure_reason: `Funnel halted: ${funnelStatus}` })
+                            });
+                            console.log(`🛑 Suppressed delivery for #${strike.id} due to Kill Switch (Funnel Status: ${funnelStatus})`);
+                        }
+                    }
+
+                    if (validIds.length > 0) {
+                        // Set them immediately to 'active' (Processing)
+                        await fetch(`${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=in.(${validIds.join(',')})`, {
+                            method: 'PATCH',
+                            headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ status: 'active' })
+                        });
+                        
+                        await env.STRIKE_QUEUE.sendBatch(messagesItems);
+                        console.log(`⏰ Queued ${validIds.length} newly activated Funnel Steps for dispatch!`);
+                    }
+                }
             }
 
             // 3. Run additional free sources in parallel (non-blocking)
