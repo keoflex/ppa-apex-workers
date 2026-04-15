@@ -3237,7 +3237,42 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
             // 1. Queue all active territory briefings to run asynchronously
             await queueTerritoryBriefings(env);
 
+            // 1b. ── Exa.ai Credit Circuit Breaker ──────────────────────────
+            // Probe Exa with a minimal request before dispatching 75 agents.
+            // If credits are exhausted (HTTP 402), skip the entire agent batch
+            // to avoid generating thousands of wasted pipeline_runs.
+            let exaCreditsAvailable = true;
+            try {
+                const probeRes = await fetch('https://api.exa.ai/search', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': env.EXA_API_KEY,
+                    },
+                    body: JSON.stringify({
+                        query: 'test',
+                        numResults: 1,
+                        type: 'neural',
+                    }),
+                });
+                if (probeRes.status === 402) {
+                    exaCreditsAvailable = false;
+                    console.warn('🚨 EXA CIRCUIT BREAKER: Credits exhausted (HTTP 402). Skipping agent dispatch batch. Replenish credits at dashboard.exa.ai');
+                } else if (probeRes.status === 429) {
+                    exaCreditsAvailable = false;
+                    console.warn('⚠️ EXA CIRCUIT BREAKER: Rate limited (HTTP 429). Skipping agent dispatch batch.');
+                } else {
+                    console.log('✅ Exa.ai credit probe OK — proceeding with agent dispatch');
+                }
+            } catch (probeErr) {
+                console.warn('⚠️ Exa credit probe failed (network error), proceeding cautiously:', probeErr);
+                // On network error, proceed anyway — might be transient
+            }
+
             // 2. Fetch up to 75 active agents that haven't run recently (staggered load balancing)
+            if (!exaCreditsAvailable) {
+                console.log('⏸️ Agent dispatch SKIPPED due to Exa credit exhaustion. Fallback sources (SEC, Court, News) will still run.');
+            } else {
             const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=id,name,persona&order=last_activity.asc.nullsfirst&limit=75`;
             const res = await fetch(url, {
                 method: 'GET',
@@ -3281,6 +3316,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 await env.STRIKE_QUEUE.sendBatch(messages);
                 console.log(`📤 Bulk-queued auto-dispatch for Agents: ${agentIds.join(', ')}`);
             }
+            } // end exaCreditsAvailable guard
 
             // 2b. Dispatch Scheduled Funnel Sequence Steps
             const nowIso = new Date().toISOString();

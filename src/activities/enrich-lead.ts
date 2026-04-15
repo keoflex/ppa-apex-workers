@@ -131,16 +131,25 @@ async function identifyExecutive(
             const parts = data?.candidates?.[0]?.content?.parts || [];
             const rawText = parts.find((p: any) => p.text)?.text;
             if (rawText) {
-                const parsed = JSON.parse(rawText) as { name?: string; title?: string };
-                if (parsed.name && parsed.name !== 'Unknown') {
-                    console.log(`✅ Gemini identified: ${parsed.name} (${parsed.title}) at ${company}`);
-                    return { name: parsed.name, title: parsed.title || 'CEO' };
+                // Strip markdown backticks or conversational prefixes
+                let jsonStr = rawText;
+                const match = rawText.match(/\{[\s\S]*\}/);
+                if (match) jsonStr = match[0];
+                
+                try {
+                    const parsed = JSON.parse(jsonStr) as { name?: string; title?: string };
+                    if (parsed.name && parsed.name !== 'Unknown') {
+                        console.log(`✅ Gemini identified: ${parsed.name} (${parsed.title}) at ${company}`);
+                        return { name: parsed.name, title: parsed.title || 'CEO' };
+                    }
+                } catch (e) {
+                    console.warn('⚠️ Gemini executive JSON parse failed:', e);
                 }
             }
         }
     } catch (err) {
         console.warn('⚠️ Gemini executive identification failed:', err);
-        await logGeminiError(env, 'pro-exec-identification', 'enrich-lead', err);
+        await logGeminiError(env, 'lite-exec-identification', 'enrich-lead', err);
     }
 
     return { name: 'Unknown', title: 'Unknown' };
@@ -516,7 +525,7 @@ Reply with ONLY a JSON object:
                 contents: [{ parts: [{ text: prompt }] }],
                 generationConfig: { 
                     temperature: 0.1, 
-                    maxOutputTokens: 400,
+                    maxOutputTokens: 1024,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "OBJECT",
@@ -542,7 +551,20 @@ Reply with ONLY a JSON object:
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
         if (!text) return null;
 
-        const parsed = JSON.parse(text);
+        // Extract JSON specifically to ignore conversational prefixes or backticks
+        let jsonStr = text;
+        const match = text.match(/\{[\s\S]*\}/);
+        if (match) {
+            jsonStr = match[0];
+        }
+
+        let parsed: any;
+        try {
+            parsed = JSON.parse(jsonStr);
+        } catch (e) {
+            console.warn(`⚠️ Failed to parse contact discovery JSON: ${e}`);
+            return null;
+        }
 
         // Map Gemini confidence to our system (AI is always lower than verified data)
         const mapConfidence = (level: string) => {
@@ -582,7 +604,7 @@ Reply with ONLY a JSON object:
         return found.length > 0 || result.companyDomain ? result : null;
     } catch (err) {
         console.warn('⚠️ Gemini contact discovery failed:', err);
-        await logGeminiError(env, 'pro-contact-discovery', 'enrich-lead', err);
+        await logGeminiError(env, 'lite-contact-discovery', 'enrich-lead', err);
     }
 
     return null;
