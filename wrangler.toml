@@ -4,12 +4,17 @@
 name = "ppa-apex-workers"
 main = "src/index.ts"
 compatibility_date = "2025-02-24"
+compatibility_flags = [ "global_fetch_strictly_public" ]
 account_id = "78ea385b814960bac401db0341907944"
 
 # ── Environment Variables ──
+# NOTE: this [vars] block ships to the DEPLOYED worker. ENVIRONMENT must be "production"
+# so the weekly digest posts to the live platform, not http://localhost:3000.
+# Use `wrangler dev` with .dev.vars to override locally.
 [vars]
-ENVIRONMENT = "development"
+ENVIRONMENT = "production"
 SES_CONFIGURATION_SET = "my-first-configuration-set"
+FORCE_EXA_RESEARCH = "false"
 
 # Secrets (set via `wrangler secret put`):
 # SUPABASE_URL
@@ -45,13 +50,15 @@ binding = "STRIKE_QUEUE"
 
 [[queues.consumers]]
 queue = "strike-pipeline"
-max_batch_size = 10
-max_batch_timeout = 30
+max_batch_size = 1
+max_batch_timeout = 5
 max_concurrency = 50
+# Give transient failures (SES throttling, Gemini 5xx) more attempts before a message is dropped.
+max_retries = 5
 
-# Every 30 minutes, 24/7/365
+# Runs every 15 minutes, 24/7/365
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/15 * * * *"]
 
 # ── R2 Storage ──
 [[r2_buckets]]

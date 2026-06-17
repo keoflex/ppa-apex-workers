@@ -70,19 +70,29 @@ export async function fetchGemini(
             if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
                 isRetryable = true;
                 errorMessage = `HTTP ${status}`;
+                if (status === 429) {
+                    try {
+                        const cloned = res.clone();
+                        const text = await cloned.text();
+                        if (text.includes('spending cap') || text.includes('RESOURCE_EXHAUSTED')) {
+                            isRetryable = false;
+                            errorMessage = `HTTP 429 (Spending Cap Exceeded)`;
+                        }
+                    } catch (_) {}
+                }
             }
         }
 
         if (isRetryable) {
             const isOverload = errorMessage.includes('503') || errorMessage.includes('429');
-            const currentMaxRetries = isOverload ? maxRetries + 2 : maxRetries;
+            const currentMaxRetries = isOverload ? maxRetries + 3 : maxRetries;
 
             // If we have retries left on the current model, do exponential backoff and retry
             if (attempt <= currentMaxRetries) {
-                const backoffMultiplier = isOverload ? 2.5 : 2;
+                const backoffMultiplier = isOverload ? 3.0 : 2.0;
                 const baseDelay = Math.pow(backoffMultiplier, attempt) * 1000;
-                const jitter = Math.random() * 1500;
-                const maxDelay = isOverload ? 30000 : 15000;
+                const jitter = Math.random() * 3000; // Increased jitter to 3s to prevent synchronized thundering herd
+                const maxDelay = isOverload ? 45000 : 15000; // Increased max backoff delay for overloaded server recovery
                 const delayMs = Math.min(maxDelay, baseDelay + jitter);
                 
                 console.warn(`⚠️ Gemini ${currentModel} encountered error: ${errorMessage}. Retrying in ${(delayMs / 1000).toFixed(1)}s (attempt ${attempt}/${currentMaxRetries})...`);
@@ -93,7 +103,7 @@ export async function fetchGemini(
             // Retries exhausted on primary -> Switch to fallback
             if (!fallbackTriggered) {
                 console.warn(`⚠️ Gemini primary ${currentModel} exhausted retries due to error: ${errorMessage}. Falling back to alternative model.`);
-                await logGeminiError(env, currentModel, activityName, new Error(`Exhausted retries: ${errorMessage}`));
+                await logGeminiError(env, currentModel, activityName, new Error(`[Primary Exhausted, Falling Back] ${errorMessage}`));
                 
                 fallbackTriggered = true;
                 attempt = 0; // Reset attempts for the fallback model

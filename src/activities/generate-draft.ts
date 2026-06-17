@@ -27,6 +27,7 @@ export interface DraftInput {
 export interface StrikeDraft {
     personaUsed: string;
     subject: string;
+    subjectB?: string;
     body: string;
     modelUsed: string;
     confidenceScore: number;
@@ -40,25 +41,93 @@ import { getRow, fetchRows } from '../utils/supabase';
 import { fetchGemini } from '../utils/gemini-fetch';
 import { GEMINI_PRO_MODEL } from '../config/gemini';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeJsonParse } from '../utils/json-repair';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
+
+// ---------------------------------------------------------------------------
+// Clean First Name Extraction Helper
+// ---------------------------------------------------------------------------
+
+function cleanNameString(name: string | null | undefined): string {
+    if (!name) return '';
+    const parts = name.trim().split(/\s+/);
+    const cleanedParts: string[] = [];
+    const seenLetters = new Set<string>();
+    let initialCount = 0;
+    
+    for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const letterOnly = part.replace(/[^a-zA-Z]/g, '').toLowerCase();
+        
+        if (letterOnly.length === 1) {
+            if (seenLetters.has(letterOnly) || initialCount >= 2) {
+                continue;
+            }
+            seenLetters.add(letterOnly);
+            initialCount++;
+        } else if (letterOnly.length > 1) {
+            if (cleanedParts.length > 0 && cleanedParts[cleanedParts.length - 1].replace(/[^a-zA-Z]/g, '').toLowerCase() === letterOnly) {
+                continue;
+            }
+        }
+        cleanedParts.push(part);
+    }
+    
+    const finalName = cleanedParts.join(' ');
+    if (finalName.length < 2) return '';
+    return finalName;
+}
+
+function getCleanFirstName(name: string | null | undefined): string {
+    if (!name || name === 'Unknown') return '';
+    const parts = name.trim().split(/\s+/);
+    const prefixes = ['dr.', 'dr', 'mr.', 'mr', 'ms.', 'ms', 'mrs.', 'mrs', 'prof.', 'prof'];
+    
+    let first = parts[0];
+    if (prefixes.includes(first.toLowerCase()) && parts.length > 1) {
+        first = parts[1];
+    }
+    
+    // If the name is an initial (e.g. 'S.' or 'S') or very short, try to find a full name part
+    if ((first.length <= 2 || (first.length === 2 && first.endsWith('.'))) && parts.length > 1) {
+        for (const part of parts) {
+            if (!prefixes.includes(part.toLowerCase()) && part.length > 2 && !part.includes('.')) {
+                return part;
+            }
+        }
+    }
+    
+    return first;
+}
 
 // ---------------------------------------------------------------------------
 // Fallback template — used when Gemini call fails
 // ---------------------------------------------------------------------------
 
 function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
-    const name = (input.lead.executiveName && input.lead.executiveName !== 'Unknown')
-        ? input.lead.executiveName.split(' ')[0]
-        : '';
-    const greeting = name ? `${name},` : 'Good morning,';
+    const cleanedName = input.lead.executiveName ? cleanNameString(input.lead.executiveName) : '';
+    const firstName = getCleanFirstName(cleanedName);
+    const hasRealName = firstName.replace(/[^a-zA-Z]/g, '').length > 1
+        && !firstName.toLowerCase().includes('decision-maker')
+        && cleanedName.toLowerCase() !== 'unknown';
+        
+    const greeting = hasRealName ? `${firstName},` : 'Good morning,';
+    const company = input.lead.company || 'your organization';
+
+    // Keep the fallback strictly neutral: the trigger may be a layoff, lawsuit, or regulatory
+    // action, so never congratulate, and never interpolate a missing headline as "undefined".
+    const newsLine = input.triggerHeadline
+        ? `I came across the recent news regarding ${company} — "${input.triggerHeadline}" — and it prompted me to reach out.`
+        : `I've been following recent developments at ${company} and wanted to reach out directly.`;
 
     const body = [
         greeting,
         '',
-        `Congratulations on the news — ${input.triggerHeadline}. This kind of transition opens a rare window where the right partnerships and advisory relationships can make a material difference in setting the trajectory for the organization.`,
+        `${newsLine} Moments like this tend to raise strategic questions where the right advisory relationships and partnerships can make a material difference.`,
         '',
-        `We've been working closely with leaders navigating similar transitions, specifically by leveraging our training initiatives and bridging partnership opportunities that align seamlessly with new leadership mandates.`,
+        `We work closely with leaders navigating similar situations — from strategic communications to partnership and advisory support aligned with their immediate priorities.`,
         '',
-        `Would it make sense to connect briefly this week? I'd love to explore how we can bridge some strategic connections that might benefit your team from day one.`,
+        `Happy to share a few thoughts if useful.`,
         '',
         `Best,`,
         signature,
@@ -66,10 +135,10 @@ function buildFallbackDraft(input: DraftInput, signature: string): StrikeDraft {
 
     return {
         personaUsed: input.persona,
-        subject: `${input.lead.company} — a thought on your new role`,
+        subject: `${company} — a quick note`,
         body,
         modelUsed: 'fallback-template',
-        confidenceScore: 0.55,
+        confidenceScore: 0.4,
     };
 }
 
@@ -142,9 +211,11 @@ export async function generateDraft(env: Env, input: DraftInput): Promise<Strike
     }
 
     // Determine if we have a real contact name
-    const hasRealName = input.lead.executiveName
-        && input.lead.executiveName !== 'Unknown'
-        && !input.lead.executiveName.toLowerCase().includes('decision-maker');
+    const cleanedName = input.lead.executiveName ? cleanNameString(input.lead.executiveName) : '';
+    const firstName = getCleanFirstName(cleanedName);
+    const hasRealName = firstName.replace(/[^a-zA-Z]/g, '').length > 1
+        && !firstName.toLowerCase().includes('decision-maker')
+        && cleanedName.toLowerCase() !== 'unknown';
 
     // Build the system prompt
     const systemPrompt = `You are ${default_sender_name}, ${default_sender_title} at ${company_name}.
@@ -196,15 +267,16 @@ WRITING STYLE RULES — THIS IS CRITICAL:
 6. Keep the closing casual and low-pressure. Something like "Happy to share a few thoughts if useful" or "Worth a quick call?" — NOT "Would 15 minutes this week make sense?"
 7. Tone: Confident but human. Knowledgeable but not lecturing. Warm but brief. You should sound like someone the reader would actually want to get coffee with. NEVER sound like an automated system.
 8. Maximum 3-4 SHORT paragraphs. No bullet points. No HTML. No bold text. No emojis.
-9. ${hasRealName ? `Address them by first name: "${input.lead.executiveName.split(' ')[0]},"` : 'DO NOT say "Unknown." Start with a warm professional opening like "Good morning," or simply begin with your observation directly.'}
+9. ${hasRealName ? `Address them by first name: "${firstName},"` : 'DO NOT say "Unknown." Start with a warm professional opening like "Good morning," or simply begin with your observation directly.'}
 9. End with ONLY this signature block:
 Best,
 ${signatureBlock}
 
 OUTPUT FORMAT:
-Respond with a JSON object ONLY (no markdown, no extra text):
+Respond with ONLY a JSON object (no markdown, no extra text):
 {
-  "subject": "<concise 6-10 word subject line that sounds human — reference the company or deal specifically>",
+  "subject": "<concise 6-10 word subject line A that sounds human — reference the company or deal specifically>",
+  "subjectB": "<concise 6-10 word alternative subject line B that uses a different angle, styling, or question>",
   "body": "<full email body including greeting and signature>"
 }`;
 
@@ -214,7 +286,7 @@ ARTICLE CONTEXT (use specific details from this to make the email feel researche
 ${input.triggerArticleText || 'No article text available — use the trigger headline and what you know about the deal type to craft an intelligent email.'}
 
 PROSPECT:
-- Name: ${hasRealName ? input.lead.executiveName : 'Not yet identified — use a warm greeting without a name'}
+- Name: ${hasRealName ? cleanedName : 'Not yet identified — use a warm greeting without a name'}
 - Title: ${input.lead.executiveTitle !== 'Unknown' ? input.lead.executiveTitle : 'Senior leadership'}
 - Company: ${input.lead.company}
 - Est. Revenue / AUM: ${input.lead.companyRevenue || 'Not available'}
@@ -252,16 +324,17 @@ ${input.steeringNotes}` : ''}`;
                     },
                 ],
                 generationConfig: {
-                    temperature: 0.85,
+                    temperature: 0.70,
                     maxOutputTokens: 8192,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "OBJECT",
                         properties: {
-                            subject: { type: "STRING" },
+                            subject: { type: "STRING", description: "Primary subject line A (focus on deal/role)" },
+                            subjectB: { type: "STRING", description: "Alternative subject line B (different style/angle)" },
                             body: { type: "STRING" }
                         },
-                        required: ["subject", "body"]
+                        required: ["subject", "subjectB", "body"]
                     }
                 },
             }),
@@ -272,50 +345,26 @@ ${input.steeringNotes}` : ''}`;
             throw new Error(`Gemini API error ${response.status}: ${errText}`);
         }
 
-        const geminiData = await response.json() as {
-            candidates?: Array<{
-                content?: { parts?: Array<{ text?: string }> };
-                finishReason?: string;
-            }>;
-        };
-
-        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-        const nonThoughtParts = parts.filter((p: any) => p.text && !p.thought);
-        let rawText = nonThoughtParts.length > 0
-            ? nonThoughtParts[nonThoughtParts.length - 1].text
-            : parts.filter((p: any) => p.text).pop()?.text;
+        const { text: rawText, finishReason } = await safeGeminiResponseParse(response);
 
         if (!rawText) {
             throw new Error('Gemini returned an empty response');
         }
-
-        let parsed: { subject?: string; body?: string };
-        try {
-            parsed = JSON.parse(rawText) as { subject?: string; body?: string };
-        } catch (parseErr) {
-            // Attempt to repair truncated JSON (Gemini sometimes cuts off mid-string)
-            try {
-                let repaired = rawText.trim();
-                // Close any unclosed strings and braces
-                if (!repaired.endsWith('}')) {
-                    // Count unmatched quotes
-                    const quoteCount = (repaired.match(/(?<!\\)"/g) || []).length;
-                    if (quoteCount % 2 !== 0) repaired += '"';
-                    if (!repaired.endsWith('}')) repaired += '}';
-                }
-                parsed = JSON.parse(repaired);
-                console.warn('⚠️ Repaired truncated Gemini JSON successfully');
-            } catch {
-                throw parseErr; // Original error — let fallback handle it
-            }
+        if (finishReason === 'MAX_TOKENS') {
+            // A truncated body would be "repaired" into valid JSON that ends mid-sentence — never send that.
+            throw new Error('Gemini draft hit MAX_TOKENS (truncated output)');
         }
 
-        if (!parsed.subject || !parsed.body) {
-            throw new Error(`Gemini response missing subject or body fields. Got: ${rawText.slice(0, 200)}`);
+        const parsed = safeJsonParse<{ subject?: string; subjectB?: string; body?: string } | null>(rawText, null);
+        if (!parsed || !parsed.subject || !parsed.body) {
+            throw new Error(`Gemini response failed to parse or missing subject/body fields. Got: ${rawText.slice(0, 200)}`);
         }
 
         const draft: StrikeDraft = {
             personaUsed: default_sender_name,
+            // Leave subjectB undefined when the model omits it — downstream A/B logic handles null,
+            // whereas a synthesized "<subject> - alt" would be sent verbatim to real prospects.
+            subjectB: parsed.subjectB || undefined,
             subject: parsed.subject,
             body: parsed.body,
             modelUsed: GEMINI_PRO_MODEL,

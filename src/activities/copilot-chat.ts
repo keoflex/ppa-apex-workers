@@ -10,6 +10,7 @@ import type { Env } from '../index';
 import { fetchGemini } from '../utils/gemini-fetch';
 import { GEMINI_PRO_MODEL, GEMINI_LITE_MODEL } from '../config/gemini';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
 import { GoogleGenAI, Schema } from '@google/genai';
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -362,8 +363,8 @@ async function executeTool(
 
                 let summary = '';
                 if (summaryRes.ok) {
-                    const summaryData = (await summaryRes.json()) as any;
-                    summary = summaryData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                    const { text: rawText } = await safeGeminiResponseParse(summaryRes);
+                    summary = rawText || '';
                 }
 
                 return {
@@ -482,10 +483,10 @@ Generate an optimized Exa neural search query.`;
                     });
 
                     if (geminiRes.ok) {
-                        const geminiData = (await geminiRes.json()) as any;
-                        const rawText = geminiData?.candidates?.[0]?.content?.parts?.find((p: any) => p.text)?.text?.trim();
-                        if (rawText) {
-                            exa_query = rawText.replace(/^["']|["']$/g, '').trim();
+                        const { text: rawText } = await safeGeminiResponseParse(geminiRes);
+                        const trimmedText = rawText?.trim();
+                        if (trimmedText) {
+                            exa_query = trimmedText.replace(/^["']|["']$/g, '').trim();
                         }
                     } else {
                         console.warn('[build_agent] Gemini Exa query generation failed, using keyword fallback');

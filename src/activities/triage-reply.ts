@@ -34,7 +34,7 @@ const KEYWORDS: Record<TriageCategory, string[]> = {
 };
 
 function keywordTriage(input: TriageInput): TriageResult {
-    const bodyLower = input.body.toLowerCase();
+    const bodyLower = (input.body || '').toLowerCase();
     let bestCategory: TriageCategory = 'not_now';
     let maxMatches = 0;
 
@@ -61,6 +61,8 @@ function keywordTriage(input: TriageInput): TriageResult {
 import { fetchGemini } from '../utils/gemini-fetch';
 import { GEMINI_PRO_MODEL } from '../config/gemini';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeJsonParse } from '../utils/json-repair';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
 
 const VALID_CATEGORIES: TriageCategory[] = [
     'direct_strike',
@@ -141,16 +143,7 @@ Classify this reply now.`;
             throw new Error(`Gemini API error ${response.status}: ${errText}`);
         }
 
-        const geminiData = await response.json() as {
-            candidates?: Array<{
-                content?: { parts?: Array<{ text?: string }> };
-                finishReason?: string;
-            }>;
-        };
-
-        // Gemini 3 may return multiple parts (text + thoughtSignature). Find the text part.
-        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-        const rawText = parts.find((p: any) => p.text)?.text;
+        const { text: rawText } = await safeGeminiResponseParse(response);
         if (!rawText) {
             throw new Error('Gemini returned an empty response');
         }
@@ -162,11 +155,9 @@ Classify this reply now.`;
             jsonStr = match[0];
         }
 
-        let parsed: any;
-        try {
-            parsed = JSON.parse(jsonStr);
-        } catch (e) {
-            throw new Error(`Failed to parse Gemini output as JSON: ${e}. Raw output: ${rawText.substring(0, 50)}...`);
+        const parsed = safeJsonParse<any>(jsonStr, null);
+        if (!parsed) {
+            throw new Error(`Failed to parse Gemini output as JSON. Raw output: ${rawText.substring(0, 50)}...`);
         }
 
         // Validate the category is strictly one of our enum values

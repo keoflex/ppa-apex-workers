@@ -55,6 +55,8 @@ const EXA_QUERIES = [
 
 import { fetchGemini } from '../utils/gemini-fetch';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeJsonParse } from '../utils/json-repair';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
 
 // ---------------------------------------------------------------------------
 // Extracted Data Type
@@ -189,6 +191,7 @@ Respond with ONLY a JSON array:
                 contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
                 generationConfig: {
                     temperature: 0.1,
+                    maxOutputTokens: 2048,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "ARRAY",
@@ -210,14 +213,13 @@ Respond with ONLY a JSON array:
 
         if (!geminiRes.ok) throw new Error(await geminiRes.text());
 
-        const geminiData = await geminiRes.json() as any;
-        // Gemini 3 may return multiple parts (text + thoughtSignature). Find the text part.
-        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-        const rawText = parts.find((p: any) => p.text)?.text;
-        console.log(`🤖 Gemini extraction: ${parts.length} parts, text length: ${rawText?.length || 0}`);
+        const { text: rawText } = await safeGeminiResponseParse(geminiRes);
 
         if (rawText) {
-            extractedData = JSON.parse(rawText) as ExtractedMeta[];
+            let jsonStr = rawText;
+            const match = rawText.match(/\[[\s\S]*\]/);
+            if (match) jsonStr = match[0];
+            extractedData = safeJsonParse<ExtractedMeta[]>(jsonStr, []);
             console.log(`📋 Extracted ${extractedData.length} meta entries from Gemini`);
         }
     } catch (err) {
@@ -232,7 +234,7 @@ Respond with ONLY a JSON array:
         if (!result) continue;
 
         // Only discard explicitly bad placeholders
-        const nameLower = meta.executiveName.toLowerCase();
+        const nameLower = (meta.executiveName || '').toLowerCase();
         if (nameLower.includes('decision-maker')) {
             console.log(`🗑️ Discarding trigger (placeholder name): ${result.title}`);
             continue;
@@ -283,7 +285,7 @@ export async function senseTriggersForAgent(env: Env, agent: any, runId?: string
             },
             body: JSON.stringify({
                 query,
-                numResults: agent.max_leads_per_run || 5, // use configured limit
+                numResults: agent.max_leads_per_run || 15, // use configured limit
                 type: 'neural',
                 useAutoprompt: true,
                 startPublishedDate: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
@@ -394,6 +396,7 @@ Respond with ONLY a JSON array:
                 contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
                 generationConfig: {
                     temperature: 0.1,
+                    maxOutputTokens: 2048,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "ARRAY",
@@ -415,12 +418,13 @@ Respond with ONLY a JSON array:
 
         if (!geminiRes.ok) throw new Error(await geminiRes.text());
 
-        const geminiData = await geminiRes.json() as any;
-        const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-        const rawText = parts.find((p: any) => p.text)?.text;
+        const { text: rawText } = await safeGeminiResponseParse(geminiRes);
 
         if (rawText) {
-            extractedData = JSON.parse(rawText) as ExtractedMeta[];
+            let jsonStr = rawText;
+            const match = rawText.match(/\[[\s\S]*\]/);
+            if (match) jsonStr = match[0];
+            extractedData = safeJsonParse<ExtractedMeta[]>(jsonStr, []);
         }
     } catch (err) {
         console.error('❌ Gemini extraction failed:', err);
@@ -433,7 +437,7 @@ Respond with ONLY a JSON array:
         const result = filteredResults[meta.index];
         if (!result) continue;
 
-        const nameLower = meta.executiveName.toLowerCase();
+        const nameLower = (meta.executiveName || '').toLowerCase();
         if (nameLower.includes('decision-maker')) {
             continue;
         }

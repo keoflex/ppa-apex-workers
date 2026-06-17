@@ -7,6 +7,8 @@ import type { Env } from '../index';
 import type { MarketTrigger } from './sense-triggers';
 import { fetchGemini } from '../utils/gemini-fetch';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeJsonParse } from '../utils/json-repair';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
 
 // ---------------------------------------------------------------------------
 // CourtListener search response shape
@@ -173,6 +175,7 @@ Rules:
                 contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
                 generationConfig: {
                     temperature: 0.1,
+                    maxOutputTokens: 2048,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "ARRAY",
@@ -193,11 +196,15 @@ Rules:
         });
         if (!geminiRes.ok) throw new Error(await geminiRes.text());
 
-        const gd = await geminiRes.json() as any;
-        const rawText = gd?.candidates?.[0]?.content?.parts?.find((p: any) => p.text)?.text;
-        if (rawText) {
-            extracted = JSON.parse(rawText);
-            console.log(`📋 Gemini extracted ${extracted.length} court entities`);
+        const { text: rawText, finishReason, wasEmpty } = await safeGeminiResponseParse(geminiRes);
+        if (wasEmpty) {
+            console.warn('⚠️ Gemini returned empty body for court extraction');
+        } else if (rawText) {
+            let jsonStr = rawText;
+            const match = rawText.match(/\[[\s\S]*\]/);
+            if (match) jsonStr = match[0];
+            extracted = safeJsonParse<ExtractedMeta[]>(jsonStr, []);
+            console.log(`📋 Gemini extracted ${extracted.length} court entities (finishReason: ${finishReason || 'STOP'})`);
         }
     } catch (err) {
         console.error('❌ Gemini court extraction failed:', err);
@@ -213,7 +220,9 @@ Rules:
         triggers.push({
             triggerId: `court-${crypto.randomUUID().slice(0, 8)}`,
             source: 'CourtListener',
-            sourceUrl: `https://www.courtlistener.com${r.docket_absolute_url}`,
+            sourceUrl: r.docket_absolute_url
+                ? `https://www.courtlistener.com${r.docket_absolute_url}`
+                : 'https://www.courtlistener.com',
             headline: `${r.caseName} — ${queryLabels[meta.index]}`,
             company: meta.company,
             executiveName: meta.executiveName,
@@ -221,7 +230,7 @@ Rules:
             relevanceScore: meta.relevanceScore ?? 65,
             detectedAt: r.dateFiled || new Date().toISOString(),
             articleText: `Federal case: ${r.caseName}. Court: ${r.court}. Filed ${r.dateFiled}. Cause: ${r.cause || 'N/A'}. Parties: ${r.party?.join(', ') || 'N/A'}`,
-            agentId: 0,
+            agentId: 1,
         });
     }
 

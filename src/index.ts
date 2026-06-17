@@ -10,6 +10,12 @@ import { senseTriggers, senseTriggersForAgent, type MarketTrigger } from './acti
 import { senseSecFilings, senseSecFilingsForQuery } from './activities/sense-sec-filings';
 import { senseCourtFilings, senseCourtFilingsForQuery } from './activities/sense-court-filings';
 import { senseNews, senseNewsForQuery } from './activities/sense-news';
+import { senseWarnNotices, senseWarnNoticesForQuery } from './activities/sense-warn';
+import { senseUsptoNotices, senseUsptoNoticesForQuery } from './activities/sense-uspto';
+import { senseSecBulk, senseSecBulkForQuery } from './activities/sense-sec-bulk';
+import { senseFederalRegister, senseFederalRegisterForQuery } from './activities/sense-federal-register';
+import { senseWarnDirect, senseWarnDirectForQuery } from './activities/sense-warn-direct';
+import { senseUsptoDirect, senseUsptoDirectForQuery } from './activities/sense-uspto-direct';
 import { deduplicateTriggers } from './utils/dedup';
 import { enrichLead, type EnrichedLead } from './activities/enrich-lead';
 import type { DraftInput } from './activities/generate-draft';
@@ -17,11 +23,14 @@ import { generateDraft } from './activities/generate-draft';
 import { queueTerritoryBriefings } from './tasks/generate-briefing';
 import { fetchGemini } from './utils/gemini-fetch';
 import { logGeminiError } from './utils/gemini-logger';
+import { safeGeminiResponseParse } from './utils/gemini-parse';
+import { safeJsonParse } from './utils/json-repair';
 import { executeCampaign } from './activities/execute-campaign';
 import { executeCampaignSes } from './activities/execute-campaign-ses';
 import { triageReply } from './activities/triage-reply';
 import { copilotChat, type CopilotRequest } from './activities/copilot-chat';
 import { insertRow, patchRow, fetchRow } from './utils/supabase';
+import { Webhook, WebhookVerificationError } from 'standardwebhooks';
 
 export interface Env {
     STRIKE_QUEUE: Queue;
@@ -41,6 +50,10 @@ export interface Env {
     AWS_SECRET_ACCESS_KEY: string;
     AWS_REGION: string;           // e.g. 'us-east-1'
     SES_CONFIGURATION_SET?: string;  // optional: for event tracking
+    WEBHOOK_SIGNING_SECRET?: string; // Gemini Webhook signing secret
+    FORCE_EXA_RESEARCH?: string;     // override to force Exa deep research
+    THROTTLE_DELAY_MS?: string;      // dynamic queue delivery sleep delay in ms
+    SOCRATA_APP_TOKEN?: string;      // Socrata open data app token
 }
 
 export default {
@@ -392,6 +405,7 @@ Instructions:
                         contents: [{ role: 'user', parts: [{ text: prompt }] }],
                         generationConfig: {
                             temperature: 0.1,
+                            maxOutputTokens: 256,
                             responseMimeType: 'application/json',
                             responseSchema: {
                                 type: "OBJECT",
@@ -423,10 +437,10 @@ Instructions:
                 const data = await res.json() as any;
                 const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
                 
-                try {
-                    const parsed = JSON.parse(text);
+                const parsed = safeJsonParse<any>(text, null);
+                if (parsed && typeof parsed === 'object') {
                     return jsonWithCors({ status: 'success', guesses: parsed.guesses || [], executiveFound: parsed.executiveFound || null });
-                } catch {
+                } else {
                     return jsonWithCors({ status: 'error', error: 'Failed to parse Gemini response' });
                 }
             } catch (err: any) {
@@ -498,19 +512,15 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     return jsonWithCors({ error: `Gemini API error ${geminiRes.status}: ${errText.slice(0, 200)}` }, { status: 502 });
                 }
 
-                const geminiData = await geminiRes.json() as any;
-                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-                const rawText = parts.find((p: any) => p.text)?.text;
+                const { text: rawText } = await safeGeminiResponseParse(geminiRes);
 
                 if (!rawText) {
-                    console.error('[ai-resync] Gemini empty response:', JSON.stringify(geminiData).slice(0, 300));
+                    console.error('[ai-resync] Gemini empty response');
                     return jsonWithCors({ error: 'Gemini returned empty response' }, { status: 502 });
                 }
 
-                let parsed: any;
-                try {
-                    parsed = JSON.parse(rawText);
-                } catch {
+                const parsed = safeJsonParse<any>(rawText, null);
+                if (!parsed || typeof parsed !== 'object') {
                     console.error('[ai-resync] Failed to parse Gemini output:', rawText.slice(0, 300));
                     return jsonWithCors({ summary: rawText.slice(0, 500), industry: null, revenue: null, headcount: null });
                 }
@@ -588,14 +598,60 @@ Generate a strategic intelligence profile for this company. Be factual, specific
         }
 
         // ── Shared-secret guard for protected routes ──
-        const protectedPaths = ['/api/execute', '/api/copilot/chat'];
-        if (protectedPaths.includes(url.pathname) && request.method === 'POST') {
+        // Everything here can drive the pipeline (burn Exa/Apollo/Gemini credits) or, via
+        // regenerate→Tier-1 auto-clearance, send real email — so all of it requires the secret.
+        // The dashboard reaches these through its server-side /api/v1/* proxy routes, which
+        // attach the secret from server env.
+        const protectedPaths = [
+            '/api/execute',
+            '/api/copilot/chat',
+            '/api/send-email',
+            '/api/regenerate',
+            '/api/re-enrich',
+            '/api/trigger-strike',
+            '/api/trigger-sweep',
+            '/api/search-mission',
+        ];
+        const protectedPrefixes = ['/api/dispatch-agent/'];
+        const isProtected = protectedPaths.includes(url.pathname)
+            || protectedPrefixes.some((p) => url.pathname.startsWith(p));
+        if (isProtected && request.method === 'POST') {
             const secret = request.headers.get('x-worker-secret');
             if (!secret || secret !== env.WORKER_SECRET) {
                 return jsonWithCors(
                     { error: 'Unauthorized — invalid or missing x-worker-secret header' },
                     { status: 401 },
                 );
+            }
+        }
+
+        // ── Gemini API Webhook Receiver ──
+        if (url.pathname === '/api/gemini-webhook' && request.method === 'POST') {
+            try {
+                if (!env.WEBHOOK_SIGNING_SECRET) {
+                    console.error('[gemini-webhook] Missing WEBHOOK_SIGNING_SECRET');
+                    return jsonWithCors({ error: 'Webhook secret not configured' }, { status: 500 });
+                }
+
+                const payload = await request.text();
+                const headers = Object.fromEntries(request.headers.entries());
+
+                const wh = new Webhook(env.WEBHOOK_SIGNING_SECRET);
+                const event = wh.verify(payload, headers) as Record<string, any>;
+
+                console.log(`🤖 Gemini Webhook Event: ${event.type} | ID: ${event.data?.id}`);
+
+                if (event.type === 'batch.succeeded') {
+                    console.log(`✅ Batch completed: ${event.data?.output_file_uri}`);
+                    // Future: Trigger queue to download and process output_file_uri
+                } else if (event.type === 'batch.failed') {
+                    console.error(`❌ Batch failed: ${event.data?.id}`);
+                }
+
+                return jsonWithCors({ status: 'received' }, { status: 200 });
+            } catch (e: any) {
+                console.error('[gemini-webhook] Verification failed:', e.message);
+                return jsonWithCors({ error: 'Signature invalid' }, { status: 400 });
             }
         }
 
@@ -615,23 +671,44 @@ Generate a strategic intelligence profile for this company. Be factual, specific
             }
         }
 
+        // Manual free sensor sweep trigger
+        if (url.pathname === '/api/trigger-sweep' && request.method === 'POST') {
+            try {
+                if (env.STRIKE_QUEUE) {
+                    await env.STRIKE_QUEUE.send({
+                        campaignId: 0,
+                        persona: 'system',
+                        action: 'free_sensor_sweep',
+                    });
+                    return new Response(JSON.stringify({ ok: true, message: 'Free sensor sweep queued' }), {
+                        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+                    });
+                }
+                return new Response(JSON.stringify({ error: 'Queue not available' }), { status: 500, headers: corsHeaders });
+            } catch (e: any) {
+                return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
+            }
+        }
+
         // Manual strike trigger → push to Queue for async processing
         if (url.pathname === '/api/trigger-strike' && request.method === 'POST') {
             try {
-                const body = await request.json() as { campaignId: number; persona: string };
+                const body = await request.json() as { campaignId: number; persona: string; runId?: number | string };
 
                 // ── Auto-reset stale agent locks before every pipeline run ──
                 try {
                     const { patchRow: patchStale } = await import('./utils/supabase');
+                    const staleThresholdTime = new Date(Date.now() - 120 * 60 * 1000).toISOString();
                     const staleRes = await fetch(
-                        `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0&select=id`,
+                        `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0&last_activity=lt.${staleThresholdTime}&select=id`,
                         { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
                     );
                     if (staleRes.ok) {
                         const staleAgents = await staleRes.json() as any[];
                         if (staleAgents.length > 0) {
+                            const staleIds = staleAgents.map(a => a.id).join(',');
                             await fetch(
-                                `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0`,
+                                `${env.SUPABASE_URL}/rest/v1/agents?id=in.(${staleIds})`,
                                 {
                                     method: 'PATCH',
                                     headers: {
@@ -648,16 +725,30 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     }
                 } catch (e) { console.warn('⚠️ Stale lock reset failed (non-blocking):', e); }
 
-                if (env.STRIKE_QUEUE) {
-                    await env.STRIKE_QUEUE.send({
-                        campaignId: body.campaignId,
-                        persona: body.persona || "Rob O'Neill",
-                        source: 'manual',
+                if (env.STRIKE_QUEUE && body.campaignId) {
+                    const caRes = await fetch(`${env.SUPABASE_URL}/rest/v1/campaign_agents?campaign_id=eq.${body.campaignId}&select=agent_id`, {
+                        headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` }
                     });
-                    return jsonWithCors(
-                        { status: 'queued', campaignId: body.campaignId },
-                        { status: 202 },
-                    );
+                    if (caRes.ok) {
+                        const caRows = await caRes.json() as any[];
+                        if (caRows.length > 0) {
+                            const messages = caRows.map(r => ({
+                                body: {
+                                    campaignId: body.campaignId,
+                                    agentId: r.agent_id,
+                                    persona: body.persona || "Rob O'Neill",
+                                    source: 'manual',
+                                    action: 'dispatch_agent',
+                                    runId: body.runId,
+                                    retryCount: 0
+                                }
+                            }));
+                            await safeQueueSendBatch(env.STRIKE_QUEUE, messages);
+                            console.log(`🚀 Manually pushed ${caRows.length} agents for Campaign #${body.campaignId} into queue.`);
+                            return jsonWithCors({ status: 'queued', campaignId: body.campaignId, agentsQueued: caRows.length }, { status: 202 });
+                        }
+                    }
+                    return jsonWithCors({ error: 'No agents found for campaign' }, { status: 400 });
                 }
 
                 // Fallback: run inline if Queue not available (local dev)
@@ -866,6 +957,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         campaignId: Number(campaign.id) || 0,
                         workflowId: body.workflowId,
                         emailSubject: campaign.email_subject || `Introduction — ${campaign.workflow_id}`,
+                        emailSubjectB: campaign.email_subject_b || null,
                         emailBody: campaign.drafted_body || campaign.email_body || '',
                         recipientEmail,
                         senderEmail,
@@ -877,15 +969,29 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                     if (!env.STRIKE_QUEUE) console.warn(`⚠️ STRIKE_QUEUE not bound, unable to queue delivery for Workflow #${body.workflowId}`);
                     console.log(`🚀 Forcing inline delivery for Workflow #${body.workflowId}...`);
                     try {
+                        let selectedSubject = campaign.email_subject || `Introduction — ${campaign.workflow_id}`;
+                        let selectedVersion = 'A';
+                        if (campaign.email_subject_b) {
+                            if (Number(campaign.id) % 2 === 0) {
+                                selectedSubject = campaign.email_subject;
+                                selectedVersion = 'A';
+                            } else {
+                                selectedSubject = campaign.email_subject_b;
+                                selectedVersion = 'B';
+                            }
+                            console.log(`⚖️ [A/B Testing] Inline selected Version ${selectedVersion}: "${selectedSubject}"`);
+                        }
+
                         const { executeCampaignSes } = await import('./activities/execute-campaign-ses');
                         const result = await executeCampaignSes(env, {
                             campaignId: Number(campaign.id) || 0,
                             workflowId: body.workflowId,
-                            emailSubject: campaign.email_subject || `Introduction — ${campaign.workflow_id}`,
+                            emailSubject: selectedSubject,
                             emailBody: campaign.drafted_body || campaign.email_body || '',
                             recipientEmail,
                             senderEmail,
                             senderName: 'Fred Posinelli',
+                            subjectVersion: selectedVersion,
                         });
                         return Response.json({ status: 'inline_delivered', result });
                     } catch (e) {
@@ -895,6 +1001,36 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                 }
             } catch (error) {
                 return Response.json({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // Send-email (called by Next.js platform or internally for alerts/digests)
+        if (url.pathname === '/api/send-email' && request.method === 'POST') {
+            try {
+                const body = await request.json() as { to: string; subject: string; html: string; senderEmail?: string; senderName?: string };
+                if (!body.to || !body.subject || !body.html) {
+                    return jsonWithCors({ error: 'Missing required fields: to, subject, html' }, { status: 400 });
+                }
+
+                // Send via AWS SES directly
+                const result = await executeCampaignSes(env, {
+                    campaignId: 0, // dummy id to skip database update
+                    workflowId: 'system-digest',
+                    emailSubject: body.subject,
+                    emailBody: body.html,
+                    recipientEmail: body.to,
+                    senderEmail: body.senderEmail || 'fred@polsinellimgmt.com',
+                    senderName: body.senderName || 'PPA APEX Platform',
+                });
+
+                if (result.error) {
+                    return jsonWithCors({ error: result.error }, { status: 500 });
+                }
+
+                return jsonWithCors({ status: 'success', sesMessageId: result.sesMessageId });
+            } catch (error: any) {
+                console.error('[send-email] Error:', error);
+                return jsonWithCors({ error: String(error) }, { status: 500 });
             }
         }
 
@@ -952,13 +1088,12 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         }),
                     }
                 );
-                const geminiBody = await geminiRes.json() as any;
+                const { text: rawText, raw: geminiBody } = await safeGeminiResponseParse(geminiRes);
                 const parts = geminiBody?.candidates?.[0]?.content?.parts || [];
-                const rawText = parts.find((p: any) => p.text)?.text;
                 steps.gemini = { status: geminiRes.status, partsCount: parts.length, rawText: rawText?.slice(0, 500) };
 
                 if (rawText) {
-                    const extracted = JSON.parse(rawText);
+                    const extracted = safeJsonParse<any[]>(rawText, []);
                     steps.extracted = extracted;
 
                     // Step C: Enrich first result
@@ -1062,6 +1197,13 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                 if (!agentIdStr) throw new Error('Missing agent ID');
                 const agentId = parseInt(agentIdStr, 10);
 
+                let requestBody: any = {};
+                try {
+                    requestBody = await request.json();
+                } catch (e) {
+                    // Body might be missing or empty
+                }
+
                 const { fetchRow, patchRow } = await import('./utils/supabase');
                 const agentRows = await fetchRow(env, 'agents', 'id', agentId);
                 if (!agentRows || agentRows.length === 0) {
@@ -1077,6 +1219,7 @@ Generate a strategic intelligence profile for this company. Be factual, specific
                         persona: agent.persona || "Rob O'Neill",
                         action: 'dispatch_agent',
                         agentId: agent.id,
+                        runId: requestBody.runId,
                     });
                 }
                 return jsonWithCors({ status: 'queued', agentId: agent.id });
@@ -1198,29 +1341,29 @@ Generate a strategic intelligence brief for this company. Focus on actionable in
                     return jsonWithCors({ error: `Gemini API error` }, { status: 502 });
                 }
 
-                const geminiData = await geminiRes.json() as any;
-                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-                const rawText = parts.find((p: any) => p.text)?.text;
+                const { text: rawText } = await safeGeminiResponseParse(geminiRes);
 
                 if (!rawText) {
                     return jsonWithCors({ error: 'Gemini returned empty response' }, { status: 502 });
                 }
 
-                let parsed: any;
-                try {
-                    parsed = JSON.parse(rawText);
-                } catch {
-                    parsed = { title: `Intelligence Brief: ${body.companyName}`, content: rawText, keyFindings: [], crossSellOpportunities: [], sourceUrls: [] };
-                }
+                const parsed = safeJsonParse<any>(rawText, null);
+                const brief = {
+                    title: parsed?.title || `Intelligence Brief: ${body.companyName}`,
+                    content: parsed?.content || rawText || '',
+                    keyFindings: parsed?.keyFindings || [],
+                    crossSellOpportunities: parsed?.crossSellOpportunities || [],
+                    sourceUrls: parsed?.sourceUrls || allResults.map(r => r.url).filter(Boolean),
+                };
 
-                console.log(`✅ Brief generated for ${body.companyName}: ${parsed.title}`);
+                console.log(`✅ Brief generated for ${body.companyName}: ${brief.title}`);
 
                 return jsonWithCors({
-                    title: parsed.title || `Intelligence Brief: ${body.companyName}`,
-                    content: parsed.content || '',
-                    keyFindings: parsed.keyFindings || [],
-                    crossSellOpportunities: parsed.crossSellOpportunities || [],
-                    sourceUrls: parsed.sourceUrls || allResults.map(r => r.url).filter(Boolean),
+                    title: brief.title,
+                    content: brief.content,
+                    keyFindings: brief.keyFindings,
+                    crossSellOpportunities: brief.crossSellOpportunities,
+                    sourceUrls: brief.sourceUrls,
                 });
             } catch (error: any) {
                 console.error('[generate-brief] Error:', error);
@@ -1301,16 +1444,9 @@ Return ONLY valid JSON:
                     return jsonWithCors({ error: 'Gemini classification failed' }, { status: 502 });
                 }
 
-                const geminiData = await geminiRes.json() as any;
-                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-                const rawText = parts.find((p: any) => p.text)?.text || '';
+                const { text: rawText } = await safeGeminiResponseParse(geminiRes);
 
-                let result: any;
-                try {
-                    result = JSON.parse(rawText);
-                } catch {
-                    result = { classification: 'not_now', confidence: 0.5, summary: 'Could not parse reply', suggested_action: 'Manual review needed' };
-                }
+                const result = safeJsonParse(rawText, null) || { classification: 'not_now', confidence: 0.5, summary: 'Could not parse reply', suggested_action: 'Manual review needed' };
 
                 console.log(`🧠 Reply classified: ${result.classification} (${result.confidence}) — ${result.summary}`);
                 return jsonWithCors(result);
@@ -1405,16 +1541,10 @@ Return ONLY valid JSON:
                     return jsonWithCors({ error: 'Gemini follow-up generation failed' }, { status: 502 });
                 }
 
-                const geminiData = await geminiRes.json() as any;
-                const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-                const rawText = parts.find((p: any) => p.text)?.text || '';
+                const { text: rawText } = await safeGeminiResponseParse(geminiRes);
+                const rawTextSafe = rawText || '';
 
-                let result: any;
-                try {
-                    result = JSON.parse(rawText);
-                } catch {
-                    result = { subject: `Follow-up: ${body.originalSubject || 'Our conversation'}`, body: rawText, reasoning: 'Raw Gemini output' };
-                }
+                const result = safeJsonParse(rawTextSafe, null) || { subject: `Follow-up: ${body.originalSubject || 'Our conversation'}`, body: rawTextSafe, reasoning: 'Raw Gemini output' };
 
                 console.log(`📧 Follow-up generated for strike ${body.strikeId} step ${body.stepNumber}: ${result.subject}`);
                 return jsonWithCors(result);
@@ -1567,15 +1697,12 @@ Return ONLY a JSON object:
                                 });
 
                                 if (geminiRes.ok) {
-                                    const geminiData = await geminiRes.json() as any;
-                                    const parts = geminiData?.candidates?.[0]?.content?.parts || [];
-                                    const nonThought = parts.filter((p: any) => p.text && !p.thought);
-                                    const rawText = nonThought.length > 0 ? nonThought[nonThought.length - 1].text : parts.find((p: any) => p.text)?.text;
+                                    const { text: rawText } = await safeGeminiResponseParse(geminiRes);
                                     if (rawText) {
-                                        try {
-                                            companyIntel = JSON.parse(rawText.trim());
-                                            console.log(`✅ Company intel summarized: ${companyIntel.description?.slice(0, 60)}...`);
-                                        } catch {
+                                        companyIntel = safeJsonParse(rawText, null);
+                                        if (companyIntel && companyIntel.description) {
+                                            console.log(`✅ Company intel summarized: ${companyIntel.description.slice(0, 60)}...`);
+                                        } else {
                                             console.warn('⚠️ Failed to parse Gemini company intel JSON');
                                         }
                                     }
@@ -1805,16 +1932,11 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             continue;
                         }
 
-                        const geminiData = await geminiRes.json() as any;
-                        const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                        const { text: rawText } = await safeGeminiResponseParse(geminiRes);
+                        const rawTextSafe = rawText || '';
                         let parsed: { subject: string; body: string };
 
-                        try {
-                            parsed = JSON.parse(rawText);
-                        } catch {
-                            // Fallback: use raw text as body
-                            parsed = { subject: body.goldDraft.subject, body: rawText };
-                        }
+                        parsed = safeJsonParse(rawTextSafe, null) || { subject: body.goldDraft.subject, body: rawTextSafe };
 
                         variants.push({
                             reporter: reporter.name,
@@ -1998,7 +2120,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
                             // Extract email fields from SES inbound format
                             const fromHeader = mailContent.commonHeaders?.from?.[0] || mailContent.source || '';
-                            const fromMatch = fromHeader.match(/^(?:"?(.+?)"?\s*)?<?([^>]+@[^>]+)>?$/);
+                            const fromMatch = fromHeader.match(/^(?:"?([^"<]+)"?\s*)?<?([^>]+@[^>]+)>?$/);
                             const senderName = fromMatch?.[1]?.trim() || fromMatch?.[2] || 'Unknown';
                             const senderEmail = fromMatch?.[2] || fromHeader;
                             const senderCompany = senderEmail.split('@')[1]?.split('.')[0] || 'Unknown';
@@ -2059,8 +2181,15 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             let campaignId = 0;
                             const inReplyTo = mailContent.commonHeaders?.inReplyTo || '';
                             if (inReplyTo) {
-                                // Look up the SES message ID in our campaigns
-                                const rows = await fetchRow(env, 'strike_campaigns', 'ses_message_id', inReplyTo.replace(/[<>]/g, ''));
+                                // Extract the core SES message ID by removing <>, and stripping the `@email.amazonses.com` domain
+                                let cleanInReplyTo = inReplyTo.replace(/[<>]/g, '');
+                                const atIndex = cleanInReplyTo.indexOf('@');
+                                if (atIndex !== -1) {
+                                    cleanInReplyTo = cleanInReplyTo.substring(0, atIndex);
+                                }
+                                
+                                // Look up the exact core SES message ID in our campaigns
+                                const rows = await fetchRow(env, 'strike_campaigns', 'ses_message_id', cleanInReplyTo);
                                 if (rows?.[0]) {
                                     campaignId = Number(rows[0].id) || 0;
                                 }
@@ -2125,7 +2254,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                     
                                     // Kill Switch: Reply received, halt all future sequence steps
                                     if (scData[0].funnel_id) {
-                                        const isOptOut = triageResult.category === 'uninterested' || triageResult.category === 'unsubscribe';
+                                        const isOptOut = triageResult.category === 'not_now';
                                         await patchRow(env, 'strike_funnels', { status: isOptOut ? 'halted_opt_out' : 'halted_replied' }, 'id', scData[0].funnel_id);
                                         console.log(`🛑 Funnel #${scData[0].funnel_id} Kill Switch triggered by Inbound Reply (Category: ${triageResult.category})`);
                                     }
@@ -2217,7 +2346,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                     if (email) {
                                         // Find lead_target by email and flag it
                                         const lookupRes = await fetch(
-                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?email=eq.${encodeURIComponent(email)}&select=id`,
+                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?enrichment_data->>email=eq.${encodeURIComponent(email)}&select=id`,
                                             {
                                                 headers: {
                                                     'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2259,7 +2388,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                     const email = recipient.emailAddress;
                                     if (email) {
                                         const lookupRes = await fetch(
-                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?email=eq.${encodeURIComponent(email)}&select=id`,
+                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?enrichment_data->>email=eq.${encodeURIComponent(email)}&select=id`,
                                             {
                                                 headers: {
                                                     'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2523,24 +2652,426 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     continue;
                 }
 
-                if (action === 'deliver') {
+                // ═══════════════════════════════════════════════════════
+                // FREE SENSOR SWEEP — runs ONCE per cron cycle
+                // High-volume government data → dedup → enrich → draft
+                // ═══════════════════════════════════════════════════════
+                if (action === 'free_sensor_sweep') {
+                    console.log('🏛️ ═══ FREE SENSOR SWEEP — HIGH VOLUME INDEPENDENT RUN ═══');
+                    const sweepStart = Date.now();
+                    try {
+                        const { senseSecBulk } = await import('./activities/sense-sec-bulk');
+                        const { senseFederalRegister } = await import('./activities/sense-federal-register');
+                        const { senseWarnDirect } = await import('./activities/sense-warn-direct');
+                        const { senseUsptoDirect } = await import('./activities/sense-uspto-direct');
+                        const { senseStateWarn } = await import('./activities/sense-state-warn');
+                        const { senseStateRegistrations } = await import('./activities/sense-state-registrations');
+                        const { senseCourtFilings } = await import('./activities/sense-court-filings');
+                        const { patchRow, fetchRow } = await import('./utils/supabase');
+
+                        // Fetch all agents to map agent_id to persona dynamically!
+                        let agentPersonaMap = new Map<number, string>();
+                        try {
+                            const agentsRes = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?select=id,persona`, {
+                                headers: {
+                                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`
+                                }
+                            });
+                            if (agentsRes.ok) {
+                                const systemAgents = await agentsRes.json() as { id: number, persona: string }[];
+                                for (const sa of systemAgents) {
+                                    agentPersonaMap.set(sa.id, sa.persona);
+                                }
+                            }
+                        } catch (agentMapErr) {
+                            console.warn('⚠️ Could not fetch agents for dynamic persona mapping, using fallbacks:', agentMapErr);
+                        }
+
+                        const fallbackPersonaMap: Record<number, string> = {
+                            1: "Rob O'Neill",
+                            2: "Fred Posinelli",
+                            3: "Fred Posinelli",
+                            4: "Fred Posinelli",
+                            5: "Rob O'Neill"
+                        };
+
+                        // Run all 7 sensors in parallel
+                        const [secResult, fedRegResult, warnResult, usptoResult, stateWarnResult, sosRegResult, courtResult] = await Promise.allSettled([
+                            senseSecBulk(env),
+                            senseFederalRegister(env),
+                            senseWarnDirect(env),
+                            senseUsptoDirect(env),
+                            senseStateWarn(env),
+                            senseStateRegistrations(env),
+                            senseCourtFilings(env),
+                        ]);
+
+                        // Merge all results
+                        const allTriggers: MarketTrigger[] = [];
+                        const sourceStats: Record<string, number> = {};
+
+                        for (const [label, result] of [
+                            ['SEC EDGAR (Bulk)', secResult],
+                            ['Federal Register', fedRegResult],
+                            ['WARN Direct (Free)', warnResult],
+                            ['USPTO Direct (Free)', usptoResult],
+                            ['WARN 50-State (Stanford)', stateWarnResult],
+                            ['State Corporate SOS', sosRegResult],
+                            ['CourtListener Federal cases', courtResult],
+                        ] as [string, PromiseSettledResult<MarketTrigger[]>][]) {
+                            if (result.status === 'fulfilled') {
+                                allTriggers.push(...result.value);
+                                sourceStats[label] = result.value.length;
+                                console.log(`✅ ${label}: ${result.value.length} triggers`);
+                            } else {
+                                sourceStats[label] = 0;
+                                console.warn(`⚠️ ${label} failed:`, result.reason);
+                            }
+                        }
+
+                        console.log(`📊 Total raw triggers from free sensors: ${allTriggers.length}`);
+
+                        // Deduplicate across all sources
+                        const dedupedTriggers = deduplicateTriggers(allTriggers);
+                        console.log(`🧹 After cross-source dedup: ${dedupedTriggers.length} unique`);
+
+                        // Check against existing DB to skip known companies
+                        let newTriggers: MarketTrigger[] = dedupedTriggers;
+                        if (dedupedTriggers.length > 0) {
+                            const companyNames = dedupedTriggers.map(t => t.company).filter(Boolean);
+                            if (companyNames.length > 0) {
+                                const { fetchRowsIn } = await import('./utils/supabase');
+                                const existingRows = await fetchRowsIn(env, 'lead_targets', 'company', companyNames);
+                                const existingSet = new Set(existingRows.map((r: any) => (r.company || '').toLowerCase()));
+                                newTriggers = dedupedTriggers.filter(t => !existingSet.has((t.company || '').toLowerCase()));
+                                console.log(`🆕 ${newTriggers.length} genuinely NEW companies (${existingSet.size} already in DB)`);
+                            }
+                        }
+
+                        // Process new triggers: FAST BULK INSERT + queue enrichment
+                        // Key insight: Cloudflare Workers have 30s CPU limit.
+                        // We can't enrich 100+ leads sequentially. Instead:
+                        // 1. Insert raw lead_targets immediately (fast)
+                        // 2. Queue individual enrichment messages (async)
+                        let inserted = 0;
+                        const queueMessages: any[] = [];
+                        if (newTriggers.length > 0) {
+                            const batch = newTriggers.slice(0, 1500);
+                            console.log(`📥 Fast-inserting ${batch.length} new leads (enrichment queued separately)...`);
+
+                            for (const trigger of batch) {
+                                try {
+                                    const workflowId = `wf-${crypto.randomUUID().slice(0, 12)}`;
+                                    const agentId = trigger.agentId || 1;
+                                    const personaUsed = agentPersonaMap.get(agentId) || fallbackPersonaMap[agentId as keyof typeof fallbackPersonaMap] || "Rob O'Neill";
+
+                                    // Fast insert: raw lead data without enrichment
+                                    const targetRes = await insertRow(env, 'lead_targets', {
+                                        company: trigger.company,
+                                        executive_name: trigger.executiveName || 'Key Decision-Maker',
+                                        executive_title: trigger.executiveTitle || 'General Counsel',
+                                        trigger_event: trigger.headline,
+                                        trigger_source: trigger.sourceUrl || null,
+                                        trigger_relevance: trigger.relevanceScore || 70,
+                                        discovered_by_agent: agentId,
+                                        enrichment_data: {
+                                            data_source: trigger.source || 'SEC EDGAR (Bulk)',
+                                            trigger_summary: trigger.articleText || '',
+                                            sources: trigger.sourceUrl ? [{ label: 'Trigger Source', url: trigger.sourceUrl }] : [],
+                                            source: 'free-sensor-sweep',
+                                            enriched_at: new Date().toISOString(),
+                                            enrichment_status: 'pending',
+                                        },
+                                    });
+
+                                    if (targetRes.ok && targetRes.data?.[0]) {
+                                        const targetId = targetRes.data[0].id;
+                                        if (!targetId) {
+                                            console.error(`❌ targetId is missing from lead_targets insert response (fast-insert) for ${trigger.company}`, targetRes.data);
+                                        } else {
+                                            // Insert a placeholder campaign for visibility in Strike Queue
+                                            const campaignRes = await insertRow(env, 'strike_campaigns', {
+                                                target_id: targetId,
+                                                status: 'pending_hitl',
+                                                persona_used: personaUsed,
+                                                email_subject: `${trigger.company} — ${trigger.headline?.slice(0, 60) || 'New Opportunity'}`,
+                                                drafted_body: `[Pending enrichment] ${trigger.articleText || trigger.headline || ''}`,
+                                                workflow_id: workflowId,
+                                                agent_id: agentId,
+                                            });
+
+                                            if (campaignRes.ok && campaignRes.data?.[0]) {
+                                                const campaignId = campaignRes.data[0].id;
+                                                queueMessages.push({
+                                                    body: {
+                                                        campaignId: campaignId,
+                                                        workflowId: workflowId,
+                                                        persona: personaUsed,
+                                                        action: 'regenerate'
+                                                    }
+                                                });
+                                            }
+
+                                            inserted++;
+                                            if (inserted <= 5) {
+                                                console.log(`✅ Lead #${targetId}: ${trigger.company} [${trigger.source}]`);
+                                            }
+                                        }
+                                    }
+                                } catch (insertErr) {
+                                    console.warn(`⚠️ Insert failed for ${trigger.company}:`, insertErr);
+                                }
+                            }
+
+                            if (env.STRIKE_QUEUE && queueMessages.length > 0) {
+                                console.log(`🚀 Dispatching ${queueMessages.length} enrichment messages to STRIKE_QUEUE...`);
+                                await safeQueueSendBatch(env.STRIKE_QUEUE, queueMessages);
+                            }
+                        }
+
+                        const elapsed = ((Date.now() - sweepStart) / 1000).toFixed(1);
+                        console.log(`🏛️ ═══ FREE SENSOR SWEEP COMPLETE ═══`);
+                        console.log(`   📊 Sources: ${JSON.stringify(sourceStats)}`);
+                        console.log(`   🧹 Deduped: ${dedupedTriggers.length} unique`);
+                        console.log(`   🆕 New: ${newTriggers.length} companies`);
+                        console.log(`   📥 Inserted: ${inserted} lead_targets + strike_campaigns`);
+                        console.log(`   ⏱️ Elapsed: ${elapsed}s`);
+
+                        msg.ack();
+                    } catch (sweepErr) {
+                        console.error('❌ Free sensor sweep failed:', sweepErr);
+                        msg.retry();
+                    }
+                    continue;
+                }
+
+                // 'dispatch' is the action used by cron 2b for due scheduled funnel steps — it is an
+                // alias of 'deliver'. (Previously it fell through to the global sense pipeline and
+                // scheduled emails were never sent.)
+                if (action === 'deliver' || action === 'dispatch') {
                     console.log(`🚀 Throttled delivery starting for Workflow #${msg.body.workflowId}...`);
                     try {
-                        const result = await executeCampaignSes(env, {
-                            campaignId: msg.body.campaignId || 0,
-                            workflowId: msg.body.workflowId,
-                            emailSubject: msg.body.emailSubject,
-                            emailBody: msg.body.emailBody,
-                            recipientEmail: msg.body.recipientEmail,
-                            senderEmail: msg.body.senderEmail,
-                            senderName: msg.body.senderName || 'Fred Posinelli',
-                        });
-                        console.log(`✅ Email sent via SES: ${result.sesMessageId}`);
+                        // Send-Time Optimization & A/B testing variables
+                        let selectedSubject = msg.body.emailSubject;
+                        let selectedVersion = 'A';
+                        let targetState = '';
+                        let campaignId = msg.body.campaignId || 0;
+                        let campaign = null;
                         
-                        // Enforce a 15-second delay to safely throttle batch campaigns and protect IP reputation.
-                        // Cloudflare Queue consumers can execute for up to 15 minutes.
-                        await new Promise(resolve => setTimeout(resolve, 15000));
+                        // 1. Dynamic lookup to resolve campaign details
+                        try {
+                            const { fetchRow } = await import('./utils/supabase');
+                            let campaignRows = [];
+                            if (campaignId > 0) {
+                                campaignRows = await fetchRow(env, 'strike_campaigns', 'id', campaignId);
+                            } else if (msg.body.workflowId) {
+                                campaignRows = await fetchRow(env, 'strike_campaigns', 'workflow_id', msg.body.workflowId);
+                            }
+                            
+                            if (campaignRows && campaignRows.length > 0) {
+                                campaign = campaignRows[0];
+                                campaignId = campaign.id;
+                            }
+                        } catch (e) {
+                            console.warn(`⚠️ Failed to fetch campaign for delivery:`, e);
+                        }
+
+                        // Idempotency guards: never re-send a campaign that already went out,
+                        // and never send one a human discarded/suppressed or that already got a reply.
+                        const terminalStatuses = ['sent', 'delivered', 'discarded', 'suppressed', 'replied'];
+                        if (campaign && (terminalStatuses.includes(campaign.status) || (campaign.sent_at && campaign.status !== 'failed'))) {
+                            console.log(`⏭️ Skipping delivery for Campaign #${campaignId} — status '${campaign.status}'${campaign.sent_at ? ` (sent_at ${campaign.sent_at})` : ''}`);
+                            msg.ack();
+                            continue;
+                        }
+                        if (!campaign && ((msg.body.campaignId || 0) > 0 || msg.body.workflowId)) {
+                            // Campaign lookup failed (transient DB error or row gone) — retry instead of sending unguarded
+                            console.warn(`⚠️ Could not resolve campaign for delivery (id=${msg.body.campaignId}, wf=${msg.body.workflowId}) — retrying`);
+                            msg.retry();
+                            continue;
+                        }
+
+                        // 2. Resolve delivery fields using DB values if missing in payload
+                        let recipientEmail = msg.body.recipientEmail;
+                        let emailBody = msg.body.emailBody;
+                        let senderEmail = msg.body.senderEmail;
+                        let senderName = msg.body.senderName || 'Fred Posinelli';
+
+                        if (campaign) {
+                            try {
+                                const { fetchRow, fetchRows, patchRow } = await import('./utils/supabase');
+                                const targetId = campaign.target_id;
+                                
+                                // A/B Subject Line selection
+                                const subjectA = campaign.email_subject || msg.body.emailSubject;
+                                const subjectB = campaign.email_subject_b || msg.body.emailSubjectB;
+                                if (subjectB) {
+                                    if (campaignId % 2 === 0) {
+                                        selectedSubject = subjectA;
+                                        selectedVersion = 'A';
+                                    } else {
+                                        selectedSubject = subjectB;
+                                        selectedVersion = 'B';
+                                    }
+                                    console.log(`⚖️ [A/B Testing] Selected Version ${selectedVersion} for Campaign #${campaignId}: "${selectedSubject}"`);
+                                } else {
+                                    selectedSubject = subjectA;
+                                }
+
+                                const trgRows = await fetchRow(env, 'lead_targets', 'id', targetId);
+                                if (trgRows && trgRows.length > 0) {
+                                    const trg = trgRows[0];
+                                    if (!recipientEmail) {
+                                        recipientEmail = trg.email || trg.enrichment_data?.email || '';
+                                    }
+                                    const ed = trg.enrichment_data || {};
+                                    targetState = ed.state || ed.state_code || ed.location?.split(',')?.pop()?.trim() || '';
+                                    if (!targetState && trg.crm_company_id) {
+                                        const compRows = await fetchRow(env, 'crm_companies', 'id', trg.crm_company_id);
+                                        if (compRows && compRows.length > 0) {
+                                            const comp = compRows[0];
+                                            targetState = comp.state || comp.hq_location?.split(',')?.pop()?.trim() || '';
+                                        }
+                                    }
+                                }
+
+                                if (!emailBody) {
+                                    emailBody = campaign.drafted_body || campaign.email_body || '';
+                                }
+
+                                // Resolve and dynamically rotate sender email if not set in DB
+                                const dbSender = campaign.sender_email;
+                                if (dbSender) {
+                                    senderEmail = dbSender;
+                                } else {
+                                    try {
+                                        const senders = await fetchRows(env, 'crm_settings_senders?status=eq.active&order=sent_count.asc&limit=1');
+                                        if (senders && senders.length > 0) {
+                                            const picked = senders[0];
+                                            senderEmail = picked.email;
+                                            
+                                            // Increment sent_count on the picked sender
+                                            await patchRow(env, 'crm_settings_senders', { sent_count: (picked.sent_count || 0) + 1 }, 'id', picked.id);
+                                            
+                                            // Save the assigned sender to the campaign in the database
+                                            await patchRow(env, 'strike_campaigns', { sender_email: senderEmail }, 'id', campaignId);
+                                            
+                                            console.log(`🔄 [Auto-Clearance Rotation] Rotated and assigned sender: ${senderEmail} (sent_count: ${picked.sent_count} → ${(picked.sent_count || 0) + 1}) for Campaign #${campaignId}`);
+                                        } else {
+                                            senderEmail = 'fred@polsinellimgmt.com';
+                                        }
+                                    } catch (err) {
+                                        console.warn(`⚠️ [Auto-Clearance Rotation] Failed to rotate sender, falling back to default:`, err);
+                                        senderEmail = 'fred@polsinellimgmt.com';
+                                    }
+                                }
+                            } catch (e) {
+                                console.warn(`⚠️ Failed to resolve database target info:`, e);
+                            }
+                        }
+
+                        // Fail safe if recipient email is still not resolved
+                        if (!recipientEmail) {
+                            throw new Error('No recipient email found for delivery');
+                        }
+
+                        const tz = getTimezoneFromState(targetState);
+                        const formatter = new Intl.DateTimeFormat('en-US', {
+                            timeZone: tz,
+                            hour: 'numeric',
+                            weekday: 'short',
+                            hour12: false
+                        });
+                        const parts = formatter.formatToParts(new Date());
+                        const partMap = Object.fromEntries(parts.map(p => [p.type, p.value]));
+                        const localHour = parseInt(partMap.hour, 10);
+                        const localWeekday = partMap.weekday;
+
+                        // Standard business hours: 9 AM - 5 PM, Mon-Fri
+                        if (localWeekday === 'Sat' || localWeekday === 'Sun' || localHour < 9 || localHour >= 17) {
+                            const delay = calculateDelayToNextBusinessHour(tz);
+                            if (campaignId > 0) {
+                                // Persist the schedule on the row and ack — queue retries are capped at 12h
+                                // and a limited retry budget, so weekend deferrals via msg.retry() would be
+                                // silently dropped. Cron 2b re-dispatches due 'scheduled' rows.
+                                const sendAtIso = new Date(Date.now() + delay * 1000).toISOString();
+                                const { patchRow } = await import('./utils/supabase');
+                                await patchRow(env, 'strike_campaigns', { status: 'scheduled', scheduled_send_at: sendAtIso }, 'id', campaignId);
+                                console.log(`⏳ [Send-Time Optimization] Campaign #${campaignId} rescheduled for ${sendAtIso}. Recipient Local Time: ${localWeekday} ${localHour}:00 (TZ: ${tz}, State: ${targetState || 'default'})`);
+                                msg.ack();
+                            } else {
+                                console.log(`⏳ [Send-Time Optimization] Deferring ad-hoc delivery by ${Math.min(delay, 43200)}s (no campaign row to reschedule).`);
+                                msg.retry({ delaySeconds: Math.min(delay, 43200) });
+                            }
+                            continue;
+                        }
+
+                        // Atomically claim the row so a concurrent deliver message (cron auto-recovery,
+                        // double approval click, queue redelivery) cannot double-send. Only one consumer
+                        // wins the conditional PATCH on sent_at IS NULL.
+                        if (campaignId > 0) {
+                            const claimRes = await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=eq.${campaignId}&sent_at=is.null&status=not.in.(sent,delivered,discarded,suppressed,replied)`,
+                                {
+                                    method: 'PATCH',
+                                    headers: {
+                                        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                                        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                        'Content-Type': 'application/json',
+                                        Prefer: 'return=representation',
+                                    },
+                                    body: JSON.stringify({ sent_at: new Date().toISOString() }),
+                                },
+                            );
+                            if (!claimRes.ok) {
+                                console.warn(`⚠️ Delivery claim failed for Campaign #${campaignId} (HTTP ${claimRes.status}) — retrying`);
+                                msg.retry();
+                                continue;
+                            }
+                            const claimedRows = await claimRes.json() as any[];
+                            if (!Array.isArray(claimedRows) || claimedRows.length === 0) {
+                                console.log(`⏭️ Campaign #${campaignId} already claimed or sent by another consumer — skipping duplicate delivery.`);
+                                msg.ack();
+                                continue;
+                            }
+                        }
+
+                        const result = await executeCampaignSes(env, {
+                            campaignId: campaignId,
+                            workflowId: msg.body.workflowId,
+                            emailSubject: selectedSubject,
+                            emailBody: emailBody,
+                            recipientEmail: recipientEmail,
+                            senderEmail: senderEmail,
+                            senderName: senderName,
+                            subjectVersion: selectedVersion,
+                        });
+
+                        if (result.error || result.status !== 'sent') {
+                            // executeCampaignSes never throws — it returns {status:'failed', error}.
+                            // Release the sent_at claim so a queue retry can re-attempt the send.
+                            console.error(`❌ SES delivery failed for Campaign #${campaignId}: ${result.error || `status=${result.status}`}`);
+                            if (campaignId > 0) {
+                                try {
+                                    const { patchRow } = await import('./utils/supabase');
+                                    await patchRow(env, 'strike_campaigns', { sent_at: null }, 'id', campaignId);
+                                } catch (unclaimErr) {
+                                    console.warn(`⚠️ Failed to release delivery claim for Campaign #${campaignId}:`, unclaimErr);
+                                }
+                            }
+                            msg.retry();
+                            continue;
+                        }
+
+                        console.log(`✅ Email sent via SES: ${result.sesMessageId}`);
+                        // Ack BEFORE throttling — sleeping first widens the redelivery window after a successful send.
                         msg.ack();
+
+                        // Enforce a safe delay to throttle batch campaigns and protect IP reputation.
+                        // Default to 8 seconds to achieve up to 10,800 daily sends while safely distributing across rotated domains.
+                        const delayMs = env.THROTTLE_DELAY_MS ? Number(env.THROTTLE_DELAY_MS) : 8000;
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
                     } catch (err) {
                         console.error(`❌ Failed to send throttled email for Workflow #${msg.body.workflowId}:`, err);
                         msg.retry();
@@ -2582,13 +3113,27 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         });
 
                         // Update the lead_targets row with the fresh enrichment data
-                        if (enrichedLead.executiveName && enrichedLead.executiveName !== 'Key Decision-Maker') {
-                            const { patchRow: patchLead } = await import('./utils/supabase');
-                            await patchLead(env, 'lead_targets', {
-                                executive_name: enrichedLead.executiveName,
-                                executive_title: enrichedLead.executiveTitle,
-                            }, 'id', lead.id);
-                        }
+                        const existingEnrichment = lead.enrichment_data || {};
+                        const { patchRow: patchLead } = await import('./utils/supabase');
+                        await patchLead(env, 'lead_targets', {
+                            executive_name: enrichedLead.executiveName || lead.executive_name,
+                            executive_title: enrichedLead.executiveTitle || lead.executive_title,
+                            enrichment_data: {
+                                ...existingEnrichment,
+                                revenue: enrichedLead.companyRevenue,
+                                employees: enrichedLead.employeeCount,
+                                signals: enrichedLead.signals,
+                                linkedin_url: enrichedLead.linkedinUrl,
+                                email: enrichedLead.email || '',
+                                phone: enrichedLead.phone || '',
+                                companyDomain: enrichedLead.companyDomain,
+                                emailConfidence: enrichedLead.emailConfidence,
+                                phoneConfidence: enrichedLead.phoneConfidence,
+                                executive_research: enrichedLead.executiveResearch || '',
+                                enriched_at: new Date().toISOString(),
+                                enrichment_status: 'completed',
+                            }
+                        }, 'id', lead.id);
                     } catch (enrichErr) {
                         console.warn('⚠️ Re-enrichment failed, using existing lead data:', enrichErr);
                         // Fall back to existing lead data
@@ -2602,8 +3147,62 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             signals: existingEnrichment.signals || [],
                             linkedinUrl: existingEnrichment.linkedin_url || null,
                             email: existingEnrichment.email || '',
+                            emailConfidence: existingEnrichment.emailConfidence || existingEnrichment.email_confidence || 'none',
+                            phone: existingEnrichment.phone || '',
+                            phoneConfidence: existingEnrichment.phoneConfidence || existingEnrichment.phone_confidence || 'none',
+                            companyDomain: existingEnrichment.companyDomain || existingEnrichment.company_domain || null,
                             executiveResearch: existingEnrichment.executive_research || '',
                         };
+                    }
+
+                    // Robust Domain-Level Deduplication (Post-Apollo/Enrichment)
+                    let isDuplicate = false;
+                    if (enrichedLead.companyDomain) {
+                        const domainRes = await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/lead_targets?enrichment_data->>companyDomain=eq.${encodeURIComponent(enrichedLead.companyDomain)}&id=neq.${lead.id}&select=id`,
+                            { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                        );
+                        if (domainRes.ok) {
+                            const matchedDomains = await domainRes.json() as any[];
+                            if (matchedDomains.length > 0) {
+                                console.log(`🔄 Skipping duplicate (Domain match via Apollo): ${enrichedLead.companyDomain}`);
+                                isDuplicate = true;
+                            }
+                        }
+                    }
+
+                    if (isDuplicate) {
+                        await patchRow(env, 'strike_campaigns', {
+                            status: 'suppressed',
+                            email_subject: 'Duplicate Domain Skipping',
+                            drafted_body: `This company domain (${enrichedLead.companyDomain || 'unknown'}) already exists in database. Skipping duplicate targeting.`,
+                            persona_used: persona || "Rob O'Neill",
+                        }, 'workflow_id', regenerateWorkflowId);
+                        msg.ack();
+                        continue;
+                    }
+
+                    // Compliance & Suppression Check
+                    let isSuppressed = false;
+                    let suppressionReason = '';
+                    if (enrichedLead.email || enrichedLead.companyDomain) {
+                        const { fetchRow } = await import('./utils/supabase');
+
+                        if (enrichedLead.email) {
+                            const emailMatches = await fetchRow(env, 'suppression_list', 'email', enrichedLead.email);
+                            if (emailMatches && emailMatches.length > 0) {
+                                isSuppressed = true;
+                                suppressionReason = emailMatches[0].reason;
+                            }
+                        }
+
+                        if (!isSuppressed && enrichedLead.companyDomain) {
+                            const domainMatches = await fetchRow(env, 'suppression_list', 'domain', enrichedLead.companyDomain);
+                            if (domainMatches && domainMatches.length > 0) {
+                                isSuppressed = true;
+                                suppressionReason = domainMatches[0].reason;
+                            }
+                        }
                     }
 
                     // Extract trigger article text from stored enrichment for better context
@@ -2635,23 +3234,58 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         if (campRows && campRows.length > 0) campaignObjective = campRows[0].objective || undefined;
                     }
 
-                    const draft = await generateDraft(env, {
-                        lead: enrichedLead,
-                        persona: senderName,
-                        triggerHeadline: lead.trigger_event,
-                        triggerArticleText,
-                        partnerProfiles,
-                        steeringNotes: steeringNotes || campaignObjective || undefined,
-                    });
+                    let draft = { subject: 'Suppressed Contact', body: `This contact was flagged against the suppression list. Reason: ${suppressionReason || 'Unknown'}` };
+                    if (!isSuppressed) {
+                        draft = await generateDraft(env, {
+                            lead: enrichedLead,
+                            persona: senderName,
+                            triggerHeadline: lead.trigger_event,
+                            triggerArticleText,
+                            partnerProfiles,
+                            steeringNotes: steeringNotes || campaignObjective || undefined,
+                        });
+                    }
+
+                    const verifiedSource = enrichedLead.emailSource === 'apollo_match' || enrichedLead.emailSource === 'apollo_search' || enrichedLead.emailSource === 'apollo_org_search';
+                    const isHighConfidenceEmail = verifiedSource && (enrichedLead.emailConfidence === 'high' || enrichedLead.emailConfidence === 'verified');
+                    const isMediumConfidenceEmail = verifiedSource && enrichedLead.emailConfidence === 'medium';
+                    const isFallbackDraft = (draft as any).modelUsed === 'fallback-template';
+                    const relevanceScore = lead.trigger_relevance || 50;
+                    const isTierOne = !isFallbackDraft && (
+                        (relevanceScore >= 75 && isHighConfidenceEmail) ||
+                        (relevanceScore >= 85 && isMediumConfidenceEmail)
+                    );
+                    const targetStatus = isSuppressed ? 'suppressed' : (isTierOne ? 'approved' : 'pending_hitl');
 
                     await patchRow(env, 'strike_campaigns', {
                         email_subject: draft.subject,
+                        email_subject_b: (draft as any).subjectB || null,
                         drafted_body: draft.body,
                         persona_used: senderName,
-                        status: 'pending_hitl'
+                        status: targetStatus,
+                        ...(isTierOne && !isSuppressed ? { approved_at: new Date().toISOString() } : {})
                     }, 'workflow_id', regenerateWorkflowId);
 
-                    console.log(`✅ Regenerated Draft for Workflow #${regenerateWorkflowId}`);
+                    // Instantly dispatch Tier 1 leads to SES delivery queue
+                    if (isTierOne && !isSuppressed && env.STRIKE_QUEUE) {
+                        console.log(`🚀 Tier 1 Auto-Clearance: Instantly dispatching ${enrichedLead.email} to SES`);
+                        // Update status to active (processing) instantly to prevent auto-recovery collision
+                        await patchRow(env, 'strike_campaigns', { status: 'active' }, 'workflow_id', regenerateWorkflowId);
+                        
+                        await env.STRIKE_QUEUE.send({
+                            action: 'deliver',
+                            campaignId: Number(campaign.id) || 0,
+                            workflowId: regenerateWorkflowId,
+                            emailSubject: draft.subject,
+                            emailSubjectB: (draft as any).subjectB || null,
+                            emailBody: draft.body,
+                            recipientEmail: enrichedLead.email,
+                            senderEmail: campaign.sender_email || 'fred@polsinellimgmt.com',
+                            senderName: senderName || 'Fred Posinelli',
+                        });
+                    }
+
+                    console.log(`✅ Regenerated and Enriched Draft for Workflow #${regenerateWorkflowId} (Status: ${targetStatus})`);
                     msg.ack();
                     continue;
                 }
@@ -2660,6 +3294,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 let strategicCampaignId: string | null = null;
                 let partnerProfiles: any[] = [];
                 let campaignObjective: string | undefined = undefined;
+                let agentCampaigns: Array<{ id: string, objective?: string, partners: any[] }> = [];
 
                 if (action === 'dispatch_agent' && msg.body.agentId) {
                     const { fetchRow, patchRow } = await import('./utils/supabase');
@@ -2693,7 +3328,8 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     });
                     const caRows = caRes.ok ? await caRes.json() as any[] : [];
 
-                    let agentCampaigns: Array<{ id: number, objective?: string, partners: any[] }> = [];
+                    // agentCampaigns is defined in outer scope
+                    agentCampaigns = [];
 
                     if (caRows.length > 0) {
                         // Use first campaign assignment for legacy fallback
@@ -2730,28 +3366,43 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         console.log(`📋 Agent #${msg.body.agentId} → mapped to ${agentCampaigns.length} campaigns for round-robin dispatch.`);
                     }
 
-                    triggers = await senseTriggersForAgent(env, agent, msg.body.runId);
+                    // ── Run Exa (paid) — agents focus on neural search ──
+                    // Free sensors now run ONCE per cron cycle via independent sweep
+                    // (not per-agent, which was causing 150x duplicate API calls).
+                    // When the cron circuit breaker reports Exa credits exhausted, skip the paid
+                    // call entirely and rely on the secondary/free sources below.
+                    const agentQuery = agent.exa_query || agent.name;
+                    let exaResults: MarketTrigger[] = [];
+                    if (msg.body.skipExa) {
+                        console.log(`⛔ Skipping Exa for Agent #${agent.id} — credit breaker tripped this cron cycle.`);
+                    } else {
+                        exaResults = await senseTriggersForAgent(env, agent, msg.body.runId);
+                    }
+                    triggers = deduplicateTriggers(exaResults);
+                    console.log(`📡 Agent #${agent.id}: ${exaResults.length} raw → ${triggers.length} unique from Exa`);
 
-                    // Quick deduplication to see if Exa found anything genuinely new
-                    let hasNewExaTriggers = false;
+                    // Quick deduplication to see if we found anything genuinely new
+                    let hasNewTriggers = false;
                     if (triggers.length > 0) {
                         const companyNames = triggers.map(t => t.company).filter(Boolean);
                         if (companyNames.length > 0) {
                             const { fetchRowsIn } = await import('./utils/supabase');
                             const existingRows = await fetchRowsIn(env, 'lead_targets', 'company', companyNames);
                             const existingCompanies = new Set(existingRows.map((r: any) => r.company));
-                            hasNewExaTriggers = triggers.some(t => !existingCompanies.has(t.company));
+                            hasNewTriggers = triggers.some(t => !existingCompanies.has(t.company));
                         } else {
-                            hasNewExaTriggers = true;
+                            hasNewTriggers = true;
                         }
                     }
 
-                    if (!hasNewExaTriggers) {
-                        console.log(`⚠️ Exa returned 0 new leads for Agent #${agent.id}, trying secondary sources...`);
-                        const [secResult, courtResult, newsResult] = await Promise.allSettled([
-                            senseSecFilingsForQuery(env, agent.exa_query || agent.name),
-                            senseCourtFilingsForQuery(env, agent.exa_query || agent.name),
-                            senseNewsForQuery(env, agent.exa_query || agent.name),
+                    if (!hasNewTriggers) {
+                        console.log(`⚠️ Exa + Free sensors returned 0 NEW leads for Agent #${agent.id}, trying paid secondary sources...`);
+                        const [secResult, courtResult, newsResult, warnResult, usptoResult] = await Promise.allSettled([
+                            senseSecFilingsForQuery(env, agentQuery),
+                            senseCourtFilingsForQuery(env, agentQuery),
+                            senseNewsForQuery(env, agentQuery),
+                            senseWarnNoticesForQuery(env, agentQuery),
+                            senseUsptoNoticesForQuery(env, agentQuery),
                         ]);
                         const fallbackTriggers: MarketTrigger[] = [];
                         const sourceStatus: Record<string, string> = {};
@@ -2759,6 +3410,8 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             ['SEC', secResult],
                             ['Court', courtResult],
                             ['News', newsResult],
+                            ['WARN', warnResult],
+                            ['USPTO', usptoResult],
                         ] as [string, PromiseSettledResult<MarketTrigger[]>][]) {
                             if (result.status === 'fulfilled') {
                                 fallbackTriggers.push(...result.value);
@@ -2769,7 +3422,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             }
                         }
                         triggers = deduplicateTriggers(fallbackTriggers);
-                        console.log(`📡 Fallback: ${fallbackTriggers.length} raw → ${triggers.length} unique from secondary sources`);
+                        console.log(`📡 Fallback: ${fallbackTriggers.length} raw → ${triggers.length} unique from paid secondary sources`);
 
                         if (triggers.length === 0) {
                             // Truly nothing from any source
@@ -2809,17 +3462,24 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         max_leads_per_run: msg.body.maxResults || 5,
                     };
 
-                    // Fan out to all sources in parallel with per-source error capture
-                    const sourceNames = ['Exa.ai', 'SEC EDGAR', 'CourtListener', 'News'];
-                    const [exaResult, secResult, courtResult, newsResult] = await Promise.allSettled([
+                    // Fan out to ALL sources in parallel — paid + FREE sensors
+                    const sourceNames = ['Exa.ai', 'SEC EDGAR', 'CourtListener', 'News', 'WARN', 'USPTO', 'SEC Bulk (Free)', 'Fed Register (Free)', 'WARN Direct (Free)', 'USPTO Direct (Free)'];
+                    const [exaResult, secResult, courtResult, newsResult, warnResult, usptoResult, secBulkResult, fedRegResult, warnDirectResult, usptoDirectResult] = await Promise.allSettled([
                         senseTriggersForAgent(env, virtualAgent, msg.body.runId),
                         senseSecFilingsForQuery(env, searchQuery),
                         senseCourtFilingsForQuery(env, searchQuery),
                         senseNewsForQuery(env, searchQuery),
+                        senseWarnNoticesForQuery(env, searchQuery),
+                        senseUsptoNoticesForQuery(env, searchQuery),
+                        // ── FREE SENSORS (no Exa/API credits) ──
+                        senseSecBulkForQuery(env, searchQuery),
+                        senseFederalRegisterForQuery(env, searchQuery),
+                        senseWarnDirectForQuery(env, searchQuery),
+                        senseUsptoDirectForQuery(env, searchQuery),
                     ]);
 
                     // Log per-source status for diagnostics
-                    const sourceResults = [exaResult, secResult, courtResult, newsResult];
+                    const sourceResults = [exaResult, secResult, courtResult, newsResult, warnResult, usptoResult, secBulkResult, fedRegResult, warnDirectResult, usptoDirectResult];
                     const sourceStatus: Record<string, string> = {};
                     const sourceErrors: string[] = [];
                     sourceResults.forEach((r, i) => {
@@ -2891,6 +3551,12 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     const t = msg.body.trigger as MarketTrigger;
                     console.log(`📡 Processing external trigger: ${t.company} (${t.source})`);
                     triggers = [t];
+                } else if (action) {
+                    // Unknown action: ack and drop. Never let an unrecognized action fall through to
+                    // the global sense pipeline — that burns Exa credits and inserts unrelated leads.
+                    console.error(`❌ Unknown queue action '${action}' for Campaign #${campaignId} — acking without processing.`);
+                    msg.ack();
+                    continue;
                 } else {
                     // Step 1: Sense market triggers (Global fallback if no agent specified)
                     triggers = await senseTriggers(env);
@@ -2902,8 +3568,9 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 }
 
                 // Process ALL non-duplicate triggers (N+1 query fixed)
+                const validTriggers = triggers.filter(t => t && t.company && t.company.trim() !== '');
                 const newTriggers = [];
-                const companyNames = triggers.map(t => t.company).filter(Boolean);
+                const companyNames = validTriggers.map(t => t.company).filter(Boolean);
                 
                 let existingCompanies = new Set<string>();
                 if (companyNames.length > 0) {
@@ -2912,7 +3579,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     existingCompanies = new Set(existingRows.map((r: any) => r.company));
                 }
 
-                for (const t of triggers) {
+                for (const t of validTriggers) {
                     if (!existingCompanies.has(t.company)) {
                         newTriggers.push(t);
                     } else {
@@ -2932,6 +3599,10 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 console.log(`🎯 Processing ${newTriggers.length} new triggers out of ${triggers.length} total`);
 
                 for (const selectedTrigger of newTriggers) {
+                    if (!selectedTrigger.company || !selectedTrigger.company.trim()) {
+                        console.warn('⚠️ Skipping trigger without company name in execution loop:', selectedTrigger.headline);
+                        continue;
+                    }
                     try {
                         // Step 2: Enrich lead via Gemini + Apollo + Exa
                         const enrichedLead = await enrichLead(env, {
@@ -3010,12 +3681,12 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
                         const currentAgentId = (selectedTrigger as any).agentId || msg.body.agentId || null;
                         const targetRes = await insertRow(env, 'lead_targets', {
-                            company: enrichedLead.company || selectedTrigger.company,
-                            executive_name: enrichedLead.executiveName || selectedTrigger.executiveName,
-                            executive_title: enrichedLead.executiveTitle || selectedTrigger.executiveTitle,
-                            trigger_event: selectedTrigger.headline,
+                            company: enrichedLead.company || selectedTrigger.company || 'Unknown Company',
+                            executive_name: enrichedLead.executiveName || selectedTrigger.executiveName || 'Key Decision-Maker',
+                            executive_title: enrichedLead.executiveTitle || selectedTrigger.executiveTitle || 'General Counsel',
+                            trigger_event: selectedTrigger.headline || 'New Opportunity',
                             trigger_source: selectedTrigger.sourceUrl || null,
-                            trigger_relevance: selectedTrigger.relevanceScore || 95,
+                            trigger_relevance: selectedTrigger.relevanceScore || 50,
                             discovered_by_agent: currentAgentId,
                             enrichment_data: {
                                 data_source: selectedTrigger.source || 'Exa.ai',
@@ -3025,6 +3696,12 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                 linkedin_url: enrichedLead.linkedinUrl,
                                 email: enrichedLead.email || '',
                                 phone: enrichedLead.phone || '',
+                                company_domain: enrichedLead.companyDomain,
+                                companyDomain: enrichedLead.companyDomain,
+                                email_confidence: enrichedLead.emailConfidence || 'none',
+                                emailConfidence: enrichedLead.emailConfidence || 'none',
+                                email_source: enrichedLead.emailSource || '',
+                                emailSource: enrichedLead.emailSource || '',
                                 executive_research: enrichedLead.executiveResearch || '',
                                 trigger_summary: selectedTrigger.articleText || '',
                                 sources: [
@@ -3046,62 +3723,84 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
                         if (targetRes.ok && targetRes.data && targetRes.data.length > 0) {
                             const targetId = targetRes.data[0].id;
-                            // Tier 1 Auto-Clearance Logic
-                            const isTierOne = selectedTrigger.relevanceScore >= 90 && enrichedLead.emailConfidence === 'verified';
-                            const targetStatus = isSuppressed ? 'suppressed' : (isTierOne ? 'approved' : 'pending_hitl');
+                            if (!targetId) {
+                                console.error(`❌ targetId is missing from lead_targets insert response for ${selectedTrigger.company}`, targetRes.data);
+                            } else {
+                                // Tier 1 Auto-Clearance Logic
+                                // Only Apollo-sourced (verified-provider) emails may auto-send. Gemini-inferred
+                                // and pattern-guessed addresses are never auto-cleared — they go to HITL.
+                                const verifiedSource = enrichedLead.emailSource === 'apollo_match' || enrichedLead.emailSource === 'apollo_search' || enrichedLead.emailSource === 'apollo_org_search';
+                                const isHighConfidenceEmail = verifiedSource && (enrichedLead.emailConfidence === 'high' || enrichedLead.emailConfidence === 'verified');
+                                const isMediumConfidenceEmail = verifiedSource && enrichedLead.emailConfidence === 'medium';
+                                const isFallbackDraft = (draft as any).modelUsed === 'fallback-template';
+                                // Missing relevance defaults LOW (50) — never assume top tier on absent data.
+                                const relevanceScore = selectedTrigger.relevanceScore || 50;
+                                const isTierOne = !isFallbackDraft && (
+                                    (relevanceScore >= 75 && isHighConfidenceEmail) ||
+                                    (relevanceScore >= 85 && isMediumConfidenceEmail)
+                                );
+                                const targetStatus = isSuppressed ? 'suppressed' : (isTierOne ? 'approved' : 'pending_hitl');
 
-                            const campaignRes = await insertRow(env, 'strike_campaigns', {
-                                target_id: targetId,
-                                status: targetStatus,
-                                persona_used: persona,
-                                email_subject: draft.subject,
-                                drafted_body: draft.body,
-                                workflow_id: workflowId,
-                                campaign_id: targetCampaignId,
-                                agent_id: currentAgentId,
-                                ...(isTierOne ? { approved_at: new Date().toISOString() } : {}),
-                            });
-
-                            // Instantly dispatch Tier 1 leads to SES delivery queue
-                            if (isTierOne && !isSuppressed && env.STRIKE_QUEUE) {
-                                console.log(`🚀 Tier 1 Auto-Clearance: Instantly dispatching ${enrichedLead.email} to SES`);
-                                await env.STRIKE_QUEUE.send({
-                                    workflowId,
-                                    action: 'deliver',
+                                const campaignRes = await insertRow(env, 'strike_campaigns', {
+                                    target_id: targetId,
+                                    status: targetStatus,
+                                    persona_used: persona,
+                                    email_subject: draft.subject,
+                                    email_subject_b: (draft as any).subjectB || null,
+                                    drafted_body: draft.body,
+                                    workflow_id: workflowId,
+                                    campaign_id: targetCampaignId,
+                                    agent_id: currentAgentId,
+                                    ...(isTierOne ? { approved_at: new Date().toISOString() } : {}),
                                 });
-                            }
 
-                            console.log(`✅ Lead #${targetId} created: ${enrichedLead.executiveName} @ ${enrichedLead.company} — "${draft.subject}"`);
-
-                            // Update agent stats immediately
-                            const agentId = (selectedTrigger as any).agentId || 1;
-                            try {
-                                const agentRow = await fetchRow(env, 'agents', 'id', agentId);
-                                if (agentRow.length > 0) {
-                                    const a = agentRow[0] as any;
-                                    await patchRow(env, 'agents', {
-                                        triggers_submitted: (a.triggers_submitted || 0) + 1,
-                                        drafts_generated: (a.drafts_generated || 0) + 1,
-                                        status: 'active',
-                                        last_activity: new Date().toISOString(),
-                                    }, 'id', agentId);
+                                // Instantly dispatch Tier 1 leads to SES delivery queue
+                                if (isTierOne && !isSuppressed && env.STRIKE_QUEUE) {
+                                    console.log(`🚀 Tier 1 Auto-Clearance: Instantly dispatching ${enrichedLead.email} to SES`);
+                                    await env.STRIKE_QUEUE.send({
+                                        workflowId,
+                                        action: 'deliver',
+                                        emailSubject: draft.subject,
+                                        emailSubjectB: (draft as any).subjectB || null,
+                                    });
                                 }
-                            } catch (_) { /* non-blocking */ }
+
+                                console.log(`✅ Lead #${targetId} created: ${enrichedLead.executiveName || 'Key Decision-Maker'} @ ${enrichedLead.company || selectedTrigger.company} — "${draft.subject}"`);
+
+                                // Update agent stats immediately
+                                const agentId = (selectedTrigger as any).agentId || 1;
+                                try {
+                                    const agentRow = await fetchRow(env, 'agents', 'id', agentId);
+                                    if (agentRow.length > 0) {
+                                        const a = agentRow[0] as any;
+                                        await patchRow(env, 'agents', {
+                                            triggers_submitted: (a.triggers_submitted || 0) + 1,
+                                            drafts_generated: (a.drafts_generated || 0) + 1,
+                                            status: 'active',
+                                            last_activity: new Date().toISOString(),
+                                        }, 'id', agentId);
+                                    }
+                                } catch (_) { /* non-blocking */ }
+                            }
                         }
 
-                        // Always reset agent lock after trigger processing (not just dispatch_agent)
-                        if ((selectedTrigger as any).agentId) {
-                            await resetAgentStatus(env, (selectedTrigger as any).agentId);
-                        }
+                        // NOTE: do NOT reset the agent lock here — we're still inside the per-trigger
+                        // loop. Clearing it mid-run lets the next cron double-dispatch this agent.
+                        // The lock is released once after the loop completes (end-of-pipeline reset).
                     } catch (triggerErr) {
                         console.error(`❌ Failed to process trigger for ${selectedTrigger.company}:`, triggerErr);
+                        try {
+                            const { logGeminiError } = await import('./utils/gemini-logger');
+                            // using gemini error logger just to surface the exception to supabase
+                            await logGeminiError(env, 'worker-crash', 'pipeline-enrich-lead', String(triggerErr), { company: selectedTrigger.company });
+                        } catch (e) { /* ignore */ }
                     }
                 }
 
                 console.log(`✅ Pipeline complete: ${newTriggers.length} triggers processed`);
 
-                // Update pipeline_runs record if this was a search mission
-                if (action === 'search_mission' && msg.body.runId) {
+                // Update pipeline_runs record
+                if (msg.body.runId) {
                     try {
                         await patchRow(env, 'pipeline_runs', {
                             status: 'completed',
@@ -3110,22 +3809,22 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             drafts_generated: newTriggers.length,
                             completed_at: new Date().toISOString(),
                             metadata: {
-                                ...(msg.body.missionId ? {
+                                ...(action === 'search_mission' && msg.body.missionId ? {
                                     mission_id: msg.body.missionId,
                                     mission_name: msg.body.missionName,
                                     territory_id: msg.body.territoryId,
                                     territory_name: msg.body.territoryName,
                                 } : {}),
-                                query: msg.body.searchQuery,
+                                query: msg.body.searchQuery || msg.body.persona || 'Agent Dispatch',
                                 triggers_total: triggers.length,
                                 triggers_new: newTriggers.length,
                                 triggers_deduplicated: triggers.length - newTriggers.length,
-                                sources_checked: 4,
+                                sources_checked: action === 'search_mission' ? 4 : 1,
                             },
                         }, 'id', msg.body.runId);
 
                         // Also update saved_searches results_count
-                        if (msg.body.missionId) {
+                        if (action === 'search_mission' && msg.body.missionId) {
                             await patchRow(env, 'saved_searches', {
                                 results_count: newTriggers.length,
                             }, 'id', msg.body.missionId);
@@ -3174,12 +3873,47 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
         console.log(`⏰ Cron triggered: ${new Date(event.scheduledTime).toISOString()}`);
 
         try {
-            // 0. Clean up stale agents (running >5 min) from previous runs
+            // 0c. Trigger Weekly Report email digest on Mondays at 8:00 AM UTC
+            try {
+                const date = new Date(event.scheduledTime || Date.now());
+                const isMonday = date.getUTCDay() === 1;
+                // Since cron runs every 15 mins, checking if hours is 8 and minutes is under 15 is safe
+                const is8AM = date.getUTCHours() === 8 && date.getUTCMinutes() < 15;
+                if (isMonday && is8AM) {
+                    console.log('⏰ Monday 8:00 AM UTC: Triggering Weekly Digest Performance Email Report...');
+                    const platformUrl = env.ENVIRONMENT === 'development'
+                        ? 'http://localhost:3000'
+                        : 'https://ppa-apex-platform.fred-78e.workers.dev';
+                    
+                    const reportRes = await fetch(`${platformUrl}/api/v1/strikes/weekly-report`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'x-worker-secret': env.WORKER_SECRET || '',
+                        }
+                    });
+
+                    if (reportRes.ok) {
+                        const reportData = await reportRes.json() as any;
+                        console.log('✅ Weekly digest email trigger completed:', JSON.stringify(reportData));
+                    } else {
+                        const reportErr = await reportRes.text();
+                        console.error('❌ Failed to trigger weekly report digest:', reportErr);
+                    }
+                }
+            } catch (digestErr) {
+                console.error('❌ Weekly report digest trigger threw an error:', digestErr);
+            }
+
+            // 0. Clean up stale agents (running >30 min) from previous runs.
+            // A single agent dispatch enriches many triggers sequentially (Apollo + Gemini + Exa),
+            // which can legitimately exceed several minutes — a 5-min reset would clear the lock
+            // mid-run and let the next cron double-dispatch the same agent.
             try {
                 const { createClient } = await import('@supabase/supabase-js');
                 const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
-                
-                const staleThreshold = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+                const staleThreshold = new Date(Date.now() - 30 * 60 * 1000).toISOString();
                 const { data: staleAgents, error: fetchErr } = await supabase
                     .from('agents')
                     .select('id, name')
@@ -3205,17 +3939,21 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 console.error('❌ Stale agent cleanup threw an error:', cleanupErr);
             }
 
-            // 0b. Bulk-reset any agents with stale pipeline locks (active_pipelines > 0)
+            // 0b. Bulk-reset agents with STALE pipeline locks (active_pipelines > 0 AND idle >30 min).
+            // The age guard is essential — clearing every lock unconditionally each cron would unlock
+            // agents whose pipeline is still actively running, causing concurrent double-dispatch.
             try {
+                const lockStaleThreshold = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+                const lockFilter = `active_pipelines=gt.0&last_activity=lt.${encodeURIComponent(lockStaleThreshold)}`;
                 const lockResetRes = await fetch(
-                    `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0&select=id`,
+                    `${env.SUPABASE_URL}/rest/v1/agents?${lockFilter}&select=id`,
                     { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
                 );
                 if (lockResetRes.ok) {
                     const lockedAgents = await lockResetRes.json() as any[];
                     if (lockedAgents.length > 0) {
                         await fetch(
-                            `${env.SUPABASE_URL}/rest/v1/agents?active_pipelines=gt.0`,
+                            `${env.SUPABASE_URL}/rest/v1/agents?${lockFilter}`,
                             {
                                 method: 'PATCH',
                                 headers: {
@@ -3232,6 +3970,39 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 }
             } catch (lockErr) {
                 console.warn('⚠️ Pipeline lock reset failed (non-blocking):', lockErr);
+            }
+
+            // 0d. Clean up stale pipeline_runs (status='running' for >30 min)
+            try {
+                const staleThreshold = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+                const staleRunQueryRes = await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/pipeline_runs?status=eq.running&started_at=lt.${staleThreshold}&select=id`,
+                    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                );
+                if (staleRunQueryRes.ok) {
+                    const staleRuns = await staleRunQueryRes.json() as any[];
+                    if (staleRuns.length > 0) {
+                        await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/pipeline_runs?status=eq.running&started_at=lt.${staleThreshold}`,
+                            {
+                                method: 'PATCH',
+                                headers: {
+                                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                                    'Content-Type': 'application/json',
+                                    Prefer: 'return=minimal',
+                                },
+                                body: JSON.stringify({
+                                    status: 'failed',
+                                    completed_at: new Date().toISOString()
+                                }),
+                            }
+                        );
+                        console.log(`🧹 CRON: Auto-reset ${staleRuns.length} stale pipeline runs to failed`);
+                    }
+                }
+            } catch (staleRunErr) {
+                console.warn('⚠️ Stale pipeline run cleanup failed (non-blocking):', staleRunErr);
             }
 
             // 1. Queue all active territory briefings to run asynchronously
@@ -3269,11 +4040,17 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 // On network error, proceed anyway — might be transient
             }
 
-            // 2. Fetch up to 75 active agents that haven't run recently (staggered load balancing)
+            let agentsDispatched = 0;
+            // 2. Fetch up to 150 active agents that haven't run recently (staggered load balancing)
+            // NOTE: Agents ALWAYS dispatch regardless of Exa credit status.
+            // FREE sensors (SEC Bulk, Fed Register, WARN Direct, USPTO Direct) cost $0,
+            // and the queue consumer handles Exa failures gracefully via Promise.allSettled.
             if (!exaCreditsAvailable) {
-                console.log('⏸️ Agent dispatch SKIPPED due to Exa credit exhaustion. Fallback sources (SEC, Court, News) will still run.');
-            } else {
-            const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=id,name,persona&order=last_activity.asc.nullsfirst&limit=75`;
+                console.log('⚠️ Exa credits exhausted — agents will still dispatch using FREE sensors (SEC Bulk, Fed Register, WARN Direct, USPTO Direct).');
+            }
+
+            const agentLimit = exaCreditsAvailable ? 150 : 20;
+            const url = `${env.SUPABASE_URL}/rest/v1/agents?status=eq.active&schedule=neq.manual&select=id,name,persona&order=last_activity.asc.nullsfirst&limit=${agentLimit}`;
             const res = await fetch(url, {
                 method: 'GET',
                 headers: {
@@ -3284,13 +4061,14 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 },
             });
             const agents = res.ok ? await res.json() as any[] : [];
+            agentsDispatched = agents.length;
 
             console.log(`📡 Cron dispatching batched stagger of ${agents.length} active scheduled agents`);
 
             if (agents.length > 0 && env.STRIKE_QUEUE) {
                 const agentIds = agents.map(a => a.id);
                 
-                // Bulk update all 75 agents to 'running' instantly in a single query
+                // Bulk update all agents to 'running' instantly in a single query
                 await fetch(`${env.SUPABASE_URL}/rest/v1/agents?id=in.(${agentIds.join(',')})`, {
                     method: 'PATCH',
                     headers: {
@@ -3302,22 +4080,35 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     body: JSON.stringify({ status: 'running' }),
                 });
 
-                // Prepare up to 75 messages for instantaneous batch queueing
+                // Prepare messages for instantaneous batch queueing.
+                // Propagate the Exa credit state so the consumer skips paid Exa calls when exhausted
+                // (the breaker probe alone doesn't stop per-agent Exa spend).
                 const messages = agents.map(agent => ({
                     body: {
                         campaignId: 0,
                         persona: agent.persona || "Rob O'Neill",
                         action: 'dispatch_agent',
                         agentId: agent.id,
+                        skipExa: !exaCreditsAvailable,
                     }
                 }));
 
-                // Dispatch entire batch to Cloudflare Queue in 1 HTTP limit sequence
-                await env.STRIKE_QUEUE.sendBatch(messages);
+                // Dispatch entire batch to Cloudflare Queue
+                await safeQueueSendBatch(env.STRIKE_QUEUE, messages);
                 console.log(`📤 Bulk-queued auto-dispatch for Agents: ${agentIds.join(', ')}`);
-            }
-            } // end exaCreditsAvailable guard
 
+                // ── Queue FREE SENSOR SWEEP — runs ONCE per cron cycle ──
+                try {
+                    await env.STRIKE_QUEUE.send({
+                        campaignId: 0,
+                        persona: 'system',
+                        action: 'free_sensor_sweep',
+                    });
+                    console.log('🏛️ Queued independent free sensor sweep (SEC, FedReg, WARN, USPTO)');
+                } catch (sweepQueueErr) {
+                    console.error('❌ Failed to queue free sensor sweep:', sweepQueueErr);
+                }
+            }
             // 2b. Dispatch Scheduled Funnel Sequence Steps
             const nowIso = new Date().toISOString();
             const schedUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.scheduled&scheduled_send_at=lte.${nowIso}&select=id,workflow_id,funnel_id,strike_funnels(status)&limit=100`;
@@ -3339,7 +4130,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                     campaignId: strike.id,
                                     workflowId: strike.workflow_id,
                                     persona: "Rob O'Neill", // Fallback persona, executor handles true persona
-                                    action: 'dispatch',
+                                    action: 'deliver',
                                     forceInline: true // Ensure fast delivery since it's scheduled
                                 }
                             });
@@ -3362,10 +4153,110 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             body: JSON.stringify({ status: 'active' })
                         });
                         
-                        await env.STRIKE_QUEUE.sendBatch(messagesItems);
+                        await safeQueueSendBatch(env.STRIKE_QUEUE, messagesItems);
                         console.log(`⏰ Queued ${validIds.length} newly activated Funnel Steps for dispatch!`);
                     }
                 }
+            }
+
+            // 2c. Auto-recover and dispatch Approved campaigns that are stuck
+            try {
+                const appUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.approved&select=id,workflow_id,email_subject,email_subject_b,drafted_body,target_id,sender_email&limit=50`;
+                const appRes = await fetch(appUrl, { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } });
+                if (appRes.ok) {
+                    const approvedStrikes = await appRes.json() as any[];
+                    if (approvedStrikes.length > 0 && env.STRIKE_QUEUE) {
+                        console.log(`⏰ Cron auto-recovering ${approvedStrikes.length} approved campaigns for delivery...`);
+                        const recoveryMessages = [];
+                        const recoveredIds = [];
+                        for (const strike of approvedStrikes) {
+                             // Find target email — select both the column and the enrichment JSON.
+                             const tr = await fetch(`${env.SUPABASE_URL}/rest/v1/lead_targets?id=eq.${strike.target_id}&select=email,enrichment_data`, {
+                                 headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` }
+                             });
+                             if (!tr.ok) {
+                                 // Transient lookup failure — skip this tick rather than destroying the campaign.
+                                 console.warn(`⚠️ Lead lookup failed (HTTP ${tr.status}) for approved campaign #${strike.id} — will retry next cron.`);
+                                 continue;
+                             }
+                             const targets = await tr.json() as any[];
+                             const target = Array.isArray(targets) ? targets[0] : undefined;
+                             const recipientEmail = target ? (target.email || target.enrichment_data?.email || '') : '';
+
+                             if (recipientEmail) {
+                                 recoveredIds.push(strike.id);
+                                 recoveryMessages.push({
+                                     body: {
+                                         action: 'deliver',
+                                         campaignId: strike.id,
+                                         workflowId: strike.workflow_id,
+                                         emailSubject: strike.email_subject || `Introduction — ${strike.workflow_id}`,
+                                         emailSubjectB: strike.email_subject_b || null,
+                                         emailBody: strike.drafted_body || '',
+                                         recipientEmail,
+                                         senderEmail: strike.sender_email || 'fred@polsinellimgmt.com',
+                                         senderName: 'Fred Posinelli',
+                                     }
+                                 });
+                            } else {
+                                // Mark as failed if no email
+                                await fetch(`${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=eq.${strike.id}`, {
+                                    method: 'PATCH',
+                                    headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ status: 'failed', failure_reason: 'No recipient email found' })
+                                });
+                                console.warn(`⚠️ Marked approved campaign #${strike.id} as failed (no recipient email)`);
+                            }
+                        }
+
+                        if (recoveryMessages.length > 0) {
+                            // Set them immediately to 'active' (Processing)
+                            await fetch(`${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=in.(${recoveredIds.join(',')})`, {
+                                method: 'PATCH',
+                                headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ status: 'active' })
+                            });
+                            
+                            await safeQueueSendBatch(env.STRIKE_QUEUE, recoveryMessages);
+                            console.log(`⏰ Successfully recovered and queued ${recoveryMessages.length} approved strikes for delivery!`);
+                        }
+                    }
+                }
+            } catch (recoveryErr) {
+                console.error('❌ Failed to run approved campaign auto-recovery:', recoveryErr);
+            }
+
+            // 2d. Recover stranded deliveries:
+            //  - rows stuck 'active' >2h with no send (their queue message was dropped after retries)
+            //  - rows with an orphaned delivery claim (sent_at set, no ses_message_id) >2h old
+            // Both are reset to 'approved' so cron 2c re-dispatches them; the atomic sent_at claim
+            // in the deliver consumer prevents any double-send.
+            try {
+                const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+                const strandedHeaders = {
+                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                    Prefer: 'return=representation',
+                };
+                const strandedActiveRes = await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.active&sent_at=is.null&updated_at=lt.${encodeURIComponent(twoHoursAgo)}&or=(approved_at.not.is.null,funnel_id.not.is.null)&select=id`,
+                    { method: 'PATCH', headers: strandedHeaders, body: JSON.stringify({ status: 'approved' }) }
+                );
+                if (strandedActiveRes.ok) {
+                    const rows = await strandedActiveRes.json() as any[];
+                    if (rows.length > 0) console.log(`🛟 Recovered ${rows.length} stranded 'active' deliveries back to 'approved': ${rows.map(r => `#${r.id}`).join(', ')}`);
+                }
+                const orphanedClaimRes = await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/strike_campaigns?sent_at=not.is.null&ses_message_id=is.null&status=in.(active,approved,scheduled)&updated_at=lt.${encodeURIComponent(twoHoursAgo)}&select=id`,
+                    { method: 'PATCH', headers: strandedHeaders, body: JSON.stringify({ sent_at: null, status: 'approved' }) }
+                );
+                if (orphanedClaimRes.ok) {
+                    const rows = await orphanedClaimRes.json() as any[];
+                    if (rows.length > 0) console.log(`🛟 Released ${rows.length} orphaned delivery claims: ${rows.map(r => `#${r.id}`).join(', ')}`);
+                }
+            } catch (strandedErr) {
+                console.warn('⚠️ Stranded delivery recovery failed (non-blocking):', strandedErr);
             }
 
             // 3. Run additional free sources in parallel (non-blocking)
@@ -3377,7 +4268,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
             // 5. Archive and purge old error logs to R2
             ctx.waitUntil(archiveOldErrorLogs(env));
 
-            console.log(`✅ Cron complete: ${agents.length} agents dispatched + additional sources + missions launched`);
+            console.log(`✅ Cron complete: ${agentsDispatched} agents dispatched + additional sources + missions launched`);
         } catch (error) {
             console.error('❌ Cron error:', error);
         }
@@ -3451,8 +4342,10 @@ async function runSavedSearchMissions(env: Env): Promise<void> {
     try {
         console.log('🎯 Checking for saved search missions to auto-run...');
 
-        // Fetch all saved searches with frequency = 'daily' + their territory info
-        const ssUrl = `${env.SUPABASE_URL}/rest/v1/saved_searches?frequency=eq.daily&select=*,territories(id,name)`;
+        // Fetch all saved searches with frequency = 'daily' that haven't run in the last ~23h.
+        // Without this floor the */15 cron dispatches every "daily" mission 96×/day (huge Exa burn).
+        const dueBefore = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
+        const ssUrl = `${env.SUPABASE_URL}/rest/v1/saved_searches?frequency=eq.daily&or=(last_run_at.is.null,last_run_at.lt.${encodeURIComponent(dueBefore)})&select=*,territories(id,name)`;
         const ssRes = await fetch(ssUrl, {
             headers: {
                 'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3521,7 +4414,7 @@ async function runSavedSearchMissions(env: Env): Promise<void> {
             }));
 
             // 3. Batch dispatch to Queue
-            await env.STRIKE_QUEUE.sendBatch(messages);
+            await safeQueueSendBatch(env.STRIKE_QUEUE, messages);
 
             // 4. Bulk Patch last_run_at state
             const searchIds = searches.map(s => s.id);
@@ -3540,6 +4433,17 @@ async function runSavedSearchMissions(env: Env): Promise<void> {
         }
     } catch (err) {
         console.error('❌ Saved search missions error:', err);
+    }
+}
+
+/**
+ * Safely send a batch of messages to a Queue by chunking them to avoid Cloudflare Queues batch limit of 100 messages.
+ */
+async function safeQueueSendBatch(queue: Queue<any>, messages: any[]): Promise<void> {
+    const CHUNK_SIZE = 50;
+    for (let i = 0; i < messages.length; i += CHUNK_SIZE) {
+        const chunk = messages.slice(i, i + CHUNK_SIZE);
+        await queue.sendBatch(chunk);
     }
 }
 
@@ -3566,9 +4470,12 @@ async function archiveOldErrorLogs(env: Env): Promise<void> {
         const oldLogs = await res.json() as any[];
         
         if (oldLogs && oldLogs.length > 0) {
-            // Convert to JSONL format
+            // Convert to JSONL format. Include a full timestamp in the key so multiple runs
+            // on the same day don't overwrite each other's archive (which previously destroyed
+            // audit data, since the source rows are deleted right after upload).
             const jsonlContent = oldLogs.map(log => JSON.stringify(log)).join('\n');
-            const fileName = `audit_logs/gemini_errors_${new Date().toISOString().split('T')[0]}_backup.jsonl`;
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `audit_logs/gemini_errors_${stamp}_backup.jsonl`;
             
             // Upload to R2
             await env.CRM_ATTACHMENTS.put(fileName, jsonlContent, {
@@ -3591,3 +4498,50 @@ async function archiveOldErrorLogs(env: Env): Promise<void> {
         console.error('❌ Error archiving old logs:', e);
     }
 }
+
+/**
+ * Helper to map US states to standard timezones for Send-Time Optimization.
+ */
+function getTimezoneFromState(state?: string): string {
+    if (!state) return 'America/Chicago'; // Default to Central
+    const s = state.toUpperCase().trim();
+    const eastern = ['CT', 'DE', 'DC', 'FL', 'GA', 'IN', 'KY', 'ME', 'MD', 'MA', 'MI', 'NH', 'NJ', 'NY', 'NC', 'OH', 'PA', 'RI', 'SC', 'TN', 'VT', 'VA', 'WV'];
+    const central = ['AL', 'AR', 'IL', 'IA', 'KS', 'LA', 'MN', 'MS', 'MO', 'NE', 'ND', 'OK', 'SD', 'TX', 'WI'];
+    const mountain = ['AZ', 'CO', 'ID', 'MT', 'NM', 'UT', 'WY'];
+    const pacific = ['CA', 'NV', 'OR', 'WA'];
+    if (eastern.includes(s)) return 'America/New_York';
+    if (central.includes(s)) return 'America/Chicago';
+    if (mountain.includes(s)) return 'America/Denver';
+    if (pacific.includes(s)) return 'America/Los_Angeles';
+    if (s === 'AK') return 'America/Anchorage';
+    if (s === 'HI') return 'Pacific/Honolulu';
+    return 'America/Chicago'; // Default
+}
+
+/**
+ * Calculates delay in seconds to the next standard business hours window (9 AM - 5 PM, Mon-Fri) in the target timezone.
+ */
+function calculateDelayToNextBusinessHour(tz: string): number {
+    const now = new Date();
+    const future = new Date(now.getTime());
+    // Try incrementing by 1 hour up to 120 hours (5 days) to find the next business day/hour
+    for (let h = 1; h <= 120; h++) {
+        future.setTime(now.getTime() + h * 60 * 60 * 1000);
+        const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: tz,
+            hour: 'numeric',
+            weekday: 'short',
+            hour12: false
+        });
+        const parts = formatter.formatToParts(future);
+        const partMap = Object.fromEntries(parts.map(p => [p.type, p.value]));
+        const localHour = parseInt(partMap.hour, 10);
+        const localWeekday = partMap.weekday;
+
+        if (localWeekday !== 'Sat' && localWeekday !== 'Sun' && localHour >= 9 && localHour < 17) {
+            return Math.max(60, Math.floor((future.getTime() - now.getTime()) / 1000));
+        }
+    }
+    return 3600; // Fallback to 1 hour
+}
+

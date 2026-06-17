@@ -7,6 +7,8 @@ import type { Env } from '../index';
 import type { MarketTrigger } from './sense-triggers';
 import { fetchGemini } from '../utils/gemini-fetch';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeJsonParse } from '../utils/json-repair';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
 
 // ---------------------------------------------------------------------------
 // NewsData.io response shape
@@ -166,6 +168,7 @@ Rules:
                 contents: [{ role: 'user', parts: [{ text: itemsPrompt }] }],
                 generationConfig: {
                     temperature: 0.1,
+                    maxOutputTokens: 2048,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "ARRAY",
@@ -186,10 +189,12 @@ Rules:
         });
         if (!geminiRes.ok) throw new Error(await geminiRes.text());
 
-        const gd = await geminiRes.json() as any;
-        const rawText = gd?.candidates?.[0]?.content?.parts?.find((p: any) => p.text)?.text;
+        const { text: rawText } = await safeGeminiResponseParse(geminiRes);
         if (rawText) {
-            extracted = JSON.parse(rawText);
+            let jsonStr = rawText;
+            const match = rawText.match(/\[[\s\S]*\]/);
+            if (match) jsonStr = match[0];
+            extracted = safeJsonParse<ExtractedMeta[]>(jsonStr, []);
             console.log(`📋 Gemini extracted ${extracted.length} news entities`);
         }
     } catch (err) {

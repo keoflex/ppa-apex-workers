@@ -15,6 +15,8 @@
  */
 import type { Env } from '../index';
 import { patchRow } from '../utils/supabase';
+import { safeGeminiResponseParse } from '../utils/gemini-parse';
+import { normalizeCompany } from '../utils/dedup';
 
 /** Fetch with timeout to avoid Cloudflare Worker 30s limit */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
@@ -62,6 +64,7 @@ export interface EnrichedLead {
     otherContacts?: ContactInfo[];
     executiveResearch?: string;
     executiveResearchUrl?: string;
+    discovery_layers_used?: string[];
 }
 
 const APOLLO_MATCH_URL = 'https://api.apollo.io/v1/people/match';
@@ -71,6 +74,7 @@ const APOLLO_ORG_ENRICH_URL = 'https://api.apollo.io/v1/organizations/enrich';
 const APOLLO_ORG_SEARCH_URL = 'https://api.apollo.io/v1/mixed_companies/search';
 import { fetchGemini } from '../utils/gemini-fetch';
 import { logGeminiError } from '../utils/gemini-logger';
+import { safeJsonParse } from '../utils/json-repair';
 
 function buildFallback(input: EnrichInput): EnrichedLead {
     return {
@@ -107,12 +111,13 @@ async function identifyExecutive(
             body: JSON.stringify({
                 system_instruction: {
                     parts: [{
-                        text: `You are a business intelligence assistant. Given a company name, return the current CEO or highest-ranking executive. Respond with ONLY a JSON object: { "name": "First Last", "title": "CEO" }. Use your best knowledge. Do NOT return "Unknown".`,
+                        text: `You are a business intelligence assistant. Given a company name, return the current CEO or highest-ranking executive. Respond with ONLY a JSON object: { "name": "First Last", "title": "CEO" }. Use your best knowledge. If you do not know the executive's name with high confidence, set the "name" field to "Unknown" and the "title" field to "Unknown".`,
                     }],
                 },
                 contents: [{ role: 'user', parts: [{ text: `Who is the current CEO or top executive at ${company}?` }] }],
                 generationConfig: {
                     temperature: 0.1,
+                    maxOutputTokens: 256,
                     responseMimeType: 'application/json',
                     responseSchema: {
                         type: "OBJECT",
@@ -127,23 +132,17 @@ async function identifyExecutive(
         });
 
         if (res.ok) {
-            const data = await res.json() as any;
-            const parts = data?.candidates?.[0]?.content?.parts || [];
-            const rawText = parts.find((p: any) => p.text)?.text;
+            const { text: rawText } = await safeGeminiResponseParse(res);
             if (rawText) {
                 // Strip markdown backticks or conversational prefixes
                 let jsonStr = rawText;
                 const match = rawText.match(/\{[\s\S]*\}/);
                 if (match) jsonStr = match[0];
                 
-                try {
-                    const parsed = JSON.parse(jsonStr) as { name?: string; title?: string };
-                    if (parsed.name && parsed.name !== 'Unknown') {
-                        console.log(`✅ Gemini identified: ${parsed.name} (${parsed.title}) at ${company}`);
-                        return { name: parsed.name, title: parsed.title || 'CEO' };
-                    }
-                } catch (e) {
-                    console.warn('⚠️ Gemini executive JSON parse failed:', e);
+                const parsed = safeJsonParse<{ name?: string; title?: string } | null>(jsonStr, null);
+                if (parsed && parsed.name && parsed.name !== 'Unknown') {
+                    console.log(`✅ Gemini identified: ${parsed.name} (${parsed.title}) at ${company}`);
+                    return { name: parsed.name, title: parsed.title || 'CEO' };
                 }
             }
         }
@@ -207,7 +206,7 @@ async function apolloPeopleSearch(
     env: Env,
     company: string,
     targetName?: string,
-): Promise<{ primary: any; others: any[]; org: any } | null> {
+): Promise<{ primary: any; others: any[]; org: any; matchedTarget: boolean } | null> {
     if (!env.APOLLO_API_KEY) return null;
 
     console.log(`🔍 Layer 3: Apollo People Search for decision-makers at ${company}...`);
@@ -234,8 +233,8 @@ async function apolloPeopleSearch(
         }
 
         const data = await res.json() as any;
-        const partialPeople = data.people || [];
-        console.log(`📥 Apollo api_search returned ${partialPeople.length} partial profiles at ${company}`);
+        const partialPeople = (data.people || []).filter((p: any) => p.first_name && p.last_name);
+        console.log(`📥 Apollo api_search returned ${partialPeople.length} valid partial profiles at ${company}`);
 
         if (partialPeople.length === 0) return null;
 
@@ -272,30 +271,28 @@ async function apolloPeopleSearch(
 
         // Try to find the target person first
         let primary: any = null;
+        let matchedTarget = false;
         if (targetName && targetName !== 'Unknown') {
-            const targetLower = targetName.toLowerCase();
-            primary = enrichedPeople.find((p: any) =>
-                `${p.first_name} ${p.last_name}`.toLowerCase().includes(targetLower) ||
-                targetLower.includes(p.last_name?.toLowerCase())
-            );
+            primary = enrichedPeople.find((p: any) => personMatchesTarget(p, targetName));
+            if (primary) matchedTarget = true;
         }
 
-        // If target not found, pick the highest-ranking person with an email
+        // If target not found, pick the highest-ranking person with an email (fallback — NOT the named target)
         if (!primary) {
-            primary = enrichedPeople.find((p: any) => p.email) || enrichedPeople[0];
+            primary = enrichedPeople.find((p: any) => isUsableEmail(p.email)) || enrichedPeople[0];
         }
 
         const others = enrichedPeople.filter((p: any) => p !== primary).slice(0, 5);
         const org = primary?.organization || enrichedPeople[0]?.organization;
 
         if (primary) {
-            console.log(`✅ Apollo Search found primary: ${primary.first_name} ${primary.last_name} (${primary.title}) | Email: ${primary.email || 'N/A'}`);
+            console.log(`✅ Apollo Search found primary: ${primary.first_name} ${primary.last_name} (${primary.title}) | Email: ${primary.email || 'N/A'} | Target match: ${matchedTarget}`);
             others.forEach((p: any) => {
                 console.log(`   + Also found: ${p.first_name} ${p.last_name} (${p.title}) | Email: ${p.email || 'N/A'}`);
             });
         }
 
-        return { primary, others, org };
+        return { primary, others, org, matchedTarget };
     } catch (err) {
         console.warn('⚠️ Apollo People Search failed:', err);
     }
@@ -308,7 +305,7 @@ async function apolloOrgAndPeopleSearch(
     env: Env,
     company: string,
     targetName?: string,
-): Promise<{ domain: string; primary: any; others: any[]; org: any } | null> {
+): Promise<{ domain: string; primary: any; others: any[]; org: any; matchedTarget: boolean } | null> {
     if (!env.APOLLO_API_KEY) return null;
 
     console.log(`🔍 Layer 4: Apollo Org Enrich for ${company}...`);
@@ -330,8 +327,15 @@ async function apolloOrgAndPeopleSearch(
 
         if (orgRes.ok) {
             const orgData = await orgRes.json() as any;
-            targetOrg = orgData.organization;
-            domain = targetOrg?.primary_domain || targetOrg?.website_url || '';
+            const guessedOrg = orgData.organization;
+            // The domain guess can resolve to a completely unrelated company (or a squatter).
+            // Only trust it if the returned org name actually matches the input company.
+            if (guessedOrg && normalizeCompany(guessedOrg.name || '') === normalizeCompany(company)) {
+                targetOrg = guessedOrg;
+                domain = targetOrg?.primary_domain || targetOrg?.website_url || '';
+            } else if (guessedOrg) {
+                console.log(`⚠️ Domain guess ${domainGuess} resolved to "${guessedOrg.name}" — name mismatch, falling back to name search.`);
+            }
         }
 
         // Fallback: try mixed_companies/search
@@ -382,8 +386,8 @@ async function apolloOrgAndPeopleSearch(
 
             if (peopleRes.ok) {
                 const pData = await peopleRes.json() as any;
-                const partialPeople = pData.people || [];
-                console.log(`📥 Apollo domain search returned ${partialPeople.length} contacts at ${domain}`);
+                const partialPeople = (pData.people || []).filter((p: any) => p.first_name && p.last_name);
+                console.log(`📥 Apollo domain search returned ${partialPeople.length} valid contacts at ${domain}`);
 
                 // Bulk match to get full profiles
                 let enrichedPeople = partialPeople;
@@ -412,24 +416,22 @@ async function apolloOrgAndPeopleSearch(
                 }
 
                 let primary: any = null;
+                let matchedTarget = false;
                 if (targetName && targetName !== 'Unknown') {
-                    const targetLower = targetName.toLowerCase();
-                    primary = enrichedPeople.find((p: any) =>
-                        `${p.first_name} ${p.last_name}`.toLowerCase().includes(targetLower) ||
-                        targetLower.includes(p.last_name?.toLowerCase())
-                    );
+                    primary = enrichedPeople.find((p: any) => personMatchesTarget(p, targetName));
+                    if (primary) matchedTarget = true;
                 }
                 if (!primary) {
-                    primary = enrichedPeople.find((p: any) => p.email) || enrichedPeople[0];
+                    primary = enrichedPeople.find((p: any) => isUsableEmail(p.email)) || enrichedPeople[0];
                 }
 
                 const others = enrichedPeople.filter((p: any) => p !== primary).slice(0, 5);
 
-                return { domain, primary, others, org: targetOrg };
+                return { domain, primary, others, org: targetOrg, matchedTarget };
             }
         }
 
-        return { domain, primary: null, others: [], org: targetOrg };
+        return { domain, primary: null, others: [], org: targetOrg, matchedTarget: false };
     } catch (err) {
         console.warn('⚠️ Apollo Org + People search failed:', err);
     }
@@ -547,8 +549,7 @@ Reply with ONLY a JSON object:
 
         if (!res.ok) return null;
 
-        const data = await res.json() as any;
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        const { text } = await safeGeminiResponseParse(res);
         if (!text) return null;
 
         // Extract JSON specifically to ignore conversational prefixes or backticks
@@ -558,11 +559,9 @@ Reply with ONLY a JSON object:
             jsonStr = match[0];
         }
 
-        let parsed: any;
-        try {
-            parsed = JSON.parse(jsonStr);
-        } catch (e) {
-            console.warn(`⚠️ Failed to parse contact discovery JSON: ${e}`);
+        const parsed = safeJsonParse<any>(jsonStr, null);
+        if (!parsed) {
+            console.warn(`⚠️ Failed to parse contact discovery JSON`);
             return null;
         }
 
@@ -654,12 +653,44 @@ async function exaDeepResearch(
     return null;
 }
 
+/** True if an email is a real address, not an Apollo locked/placeholder sentinel. */
+function isUsableEmail(email: string | null | undefined): boolean {
+    if (!email) return false;
+    const e = email.toLowerCase().trim();
+    if (e.includes('email_not_unlocked')) return false; // Apollo "not revealed" placeholder
+    if (e.endsWith('@domain.com')) return false;          // Apollo generic sentinel
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return false;
+    return true;
+}
+
+/**
+ * Whether an Apollo person plausibly IS the requested target executive.
+ * Requires a last-name token match plus a first-name/initial agreement — prevents
+ * substring false positives like "kathleen".includes("lee").
+ */
+function personMatchesTarget(person: any, targetName?: string): boolean {
+    if (!targetName || targetName === 'Unknown') return false;
+    const tgt = targetName.toLowerCase().replace(/[^a-z\s]/g, '').trim().split(/\s+/).filter(Boolean);
+    if (tgt.length === 0) return false;
+    const pFirst = (person.first_name || '').toLowerCase().replace(/[^a-z]/g, '');
+    const pLast = (person.last_name || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (!pLast) return false;
+    const tgtFirst = tgt[0];
+    const tgtLast = tgt[tgt.length - 1];
+    // Last names must match as whole tokens (allow one to be a prefix only when ≥4 chars, for hyphenations)
+    const lastMatch = pLast === tgtLast || (tgtLast.length >= 4 && pLast.startsWith(tgtLast)) || (pLast.length >= 4 && tgtLast.startsWith(pLast));
+    if (!lastMatch) return false;
+    // First name: full match or shared initial (handles "Mike"/"Michael" loosely via initial)
+    const firstMatch = !pFirst || !tgtFirst || pFirst === tgtFirst || pFirst[0] === tgtFirst[0];
+    return firstMatch;
+}
+
 // Helper to extract contact info from an Apollo person object
 function extractContact(person: any, source: string): ContactInfo {
     return {
         name: `${person.first_name || ''} ${person.last_name || ''}`.trim(),
         title: person.title || 'Unknown',
-        email: person.email || '',
+        email: isUsableEmail(person.email) ? person.email : '',
         phone: person.phone_numbers?.[0]?.sanitized_number || person.phone_number?.sanitized_number || '',
         linkedinUrl: person.linkedin_url || '',
         seniority: person.seniority || '',
@@ -718,8 +749,10 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
             }
         }
 
-        // STEP 3: Apollo People Search (by company + seniority) — ALWAYS run for other contacts
-        {
+        const hasVerifiedEmail = emailFound && (lead.emailConfidence === 'high' || lead.emailConfidence === 'medium');
+
+        // STEP 3: Apollo People Search (by company + seniority) — skipped if verified email found in Step 2
+        if (!hasVerifiedEmail) {
             const searchResult = await apolloPeopleSearch(env, input.company, exec.name);
             if (searchResult) {
                 if (searchResult.primary) {
@@ -727,7 +760,10 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                     if (primary.email && !emailFound) {
                         lead.email = primary.email;
                         lead.emailSource = 'apollo_search';
-                        lead.emailConfidence = 'high';
+                        // 'high' only when this is genuinely the requested executive; a fallback
+                        // "any decision-maker with an email" pick is 'medium' so it can't auto-send
+                        // a role-specific email to the wrong person.
+                        lead.emailConfidence = searchResult.matchedTarget ? 'high' : 'medium';
                         emailFound = true;
                         lead.executiveName = primary.name || lead.executiveName;
                         lead.executiveTitle = primary.title || lead.executiveTitle;
@@ -741,10 +777,14 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                 }
                 orgData = searchResult.org || orgData;
             }
+        } else {
+            console.log('🕵️ Skipping Step 3 (Apollo People Search) — high/medium confidence email already verified in Step 2.');
         }
 
-        // STEP 4: Apollo Org → Domain → People Search — ALWAYS run for company data + more contacts
-        if (!lead.companyDomain || otherContacts.length === 0) {
+        const currentVerified = emailFound && (lead.emailConfidence === 'high' || lead.emailConfidence === 'medium');
+
+        // STEP 4: Apollo Org → Domain → People Search — skipped if verified email already found
+        if (!currentVerified && (!lead.companyDomain || otherContacts.length === 0)) {
             const orgResult = await apolloOrgAndPeopleSearch(env, input.company, exec.name);
             if (orgResult) {
                 lead.companyDomain = orgResult.domain || lead.companyDomain;
@@ -753,7 +793,7 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                     if (primary.email && !emailFound) {
                         lead.email = primary.email;
                         lead.emailSource = 'apollo_org_search';
-                        lead.emailConfidence = 'high';
+                        lead.emailConfidence = orgResult.matchedTarget ? 'high' : 'medium';
                         emailFound = true;
                         lead.executiveName = primary.name || lead.executiveName;
                         lead.executiveTitle = primary.title || lead.executiveTitle;
@@ -772,6 +812,18 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                     }
                 }
                 orgData = orgResult.org || orgData;
+            }
+        } else {
+            if (currentVerified) {
+                console.log('🕵️ Skipping Step 4 (Apollo Org Search) — high/medium confidence email already verified.');
+                // Smart fallback: extract domain from verified email if domain is not set
+                if (!lead.companyDomain && lead.email) {
+                    const domainParts = lead.email.split('@');
+                    if (domainParts[1]) {
+                        lead.companyDomain = domainParts[1];
+                        console.log(`🌐 Smart Short-Circuit: Extracted domain from verified email: ${lead.companyDomain}`);
+                    }
+                }
             }
         }
 
@@ -828,19 +880,26 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
 
         // Deduplicate other contacts (by email or name)
         const seen = new Set<string>();
-        seen.add(lead.executiveName.toLowerCase());
+        seen.add((lead.executiveName || '').toLowerCase());
         lead.otherContacts = otherContacts.filter(c => {
-            const key = c.email || c.name.toLowerCase();
+            const key = c.email || (c.name || '').toLowerCase();
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
         });
 
         // STEP 6: Deep executive research (Exa)
-        const research = await exaDeepResearch(env, lead.executiveName, lead.company);
-        if (research) {
-            lead.executiveResearch = research.text;
-            lead.executiveResearchUrl = research.url;
+        const finalVerified = emailFound && (lead.emailConfidence === 'high' || lead.emailConfidence === 'medium');
+        const forceExa = env.FORCE_EXA_RESEARCH === 'true';
+
+        if (!finalVerified || forceExa) {
+            const research = await exaDeepResearch(env, lead.executiveName, lead.company);
+            if (research) {
+                lead.executiveResearch = research.text;
+                lead.executiveResearchUrl = research.url;
+            }
+        } else {
+            console.log('🕵️ Skipping Step 6 (Exa Deep Research) — high/medium confidence email already verified, credit budget preserved.');
         }
 
         // STEP 7: Verify LinkedIn URLs (filter out 404s)
@@ -867,6 +926,15 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
             console.log(`   Patterns: ${lead.patternEmails.join(', ')}`);
         }
 
+        lead.discovery_layers_used = [
+            'gemini_id',
+            ...(lead.emailSource === 'apollo_match' ? ['apollo_match'] : []),
+            ...(lead.emailSource === 'apollo_search' ? ['apollo_search'] : []),
+            ...(lead.emailSource === 'apollo_org_search' ? ['apollo_org_search'] : []),
+            ...(lead.emailSource === 'pattern_guess' ? ['pattern_guess'] : []),
+            ...((!finalVerified || forceExa) ? ['exa_research'] : []),
+        ];
+
         // Write enrichment data back to Supabase
         if (input.leadId) {
             const writeResult = await patchRow(env, 'lead_targets', {
@@ -892,14 +960,7 @@ export async function enrichLead(env: Env, input: EnrichInput): Promise<Enriched
                     ],
                     source: 'gemini+apollo+exa',
                     enriched_at: new Date().toISOString(),
-                    discovery_layers_used: [
-                        'gemini_id',
-                        ...(lead.emailSource === 'apollo_match' ? ['apollo_match'] : []),
-                        ...(lead.emailSource === 'apollo_search' ? ['apollo_search'] : []),
-                        ...(lead.emailSource === 'apollo_org_search' ? ['apollo_org_search'] : []),
-                        ...(lead.emailSource === 'pattern_guess' ? ['pattern_guess'] : []),
-                        'exa_research',
-                    ],
+                    discovery_layers_used: lead.discovery_layers_used,
                 },
             }, 'id', input.leadId);
 

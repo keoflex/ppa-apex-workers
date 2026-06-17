@@ -1,12 +1,20 @@
 /**
  * Activity: Advance Sequences
- * Runs via cron to evaluate all active sequence enrollments.
- * If an enrollment's next_send_at is due (or past due), it:
- * 1. Checks if the prospect has replied. If yes, it pauses the enrollment.
- * 2. Determines the next step from the sequence template.
- * 3. Generates the draft for that step via `generateDraft`.
- * 4. Inserts a new `sequence_step_drafts` record requiring HITL approval.
- * 5. Updates the enrollment `next_send_at` based on the step's delay.
+ *
+ * ⚠️ DEPRECATED / NOT WIRED IN — DO NOT ENABLE WITHOUT A REWRITE.
+ * As of this review, `advanceSequences` is not imported or invoked by any cron, queue, or HTTP
+ * handler in src/. It also depends on a Supabase `execute_sql` RPC that does NOT exist in the
+ * database (calls return PGRST202), so every query here fails. The live multi-step sequencing
+ * is the Funnel Engine: `strike_funnels` + `strike_campaigns.scheduled_send_at`, dispatched by
+ * the cron "2b. Dispatch Scheduled Funnel Sequence Steps" block in src/index.ts.
+ *
+ * Known issues to fix BEFORE wiring this in:
+ *  - Raw SQL string interpolation (SQL-injection risk via draft subject/body) — use insertRow().
+ *  - `next_send_at` is never advanced, so it would re-draft every step on every cron tick,
+ *    ignoring per-step delays and prior-step approval/send state.
+ *  - `hasReplied` is hardcoded false (replies never pause the sequence).
+ *  - Reads camelCase enrichment keys (companyRevenue/employeeCount/linkedinUrl) that the
+ *    enrichment writer stores in snake_case — follow-ups lose all personalization context.
  */
 import type { Env } from '../index';
 import { getRow } from '../utils/supabase';

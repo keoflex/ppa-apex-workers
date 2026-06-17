@@ -179,23 +179,26 @@ export async function fetchRowsIn(
     filterValues: string[]
 ): Promise<any[]> {
     if (!filterValues || filterValues.length === 0) return [];
-    
-    // PostgREST "in" operator requires double quotes if strings contain commas.
-    const inArgs = filterValues.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
-    const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filterColumn}=in.(${encodeURIComponent(inArgs)})&select=*`;
-    
-    try {
-        const res = await fetch(url, {
-            method: 'GET',
-            headers: headers(env),
-        });
+
+    // Chunk the IN list so the GET URL never exceeds server limits (a too-long URL
+    // would 414/400 and, if swallowed, disable dedup for the whole batch → mass duplicates).
+    const CHUNK = 100;
+    const out: any[] = [];
+    for (let i = 0; i < filterValues.length; i += CHUNK) {
+        const slice = filterValues.slice(i, i + CHUNK);
+        // PostgREST "in" wraps each value in double quotes; embedded quotes are backslash-escaped.
+        const inArgs = slice
+            .map(v => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`)
+            .join(',');
+        const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filterColumn}=in.(${encodeURIComponent(inArgs)})&select=*`;
+        const res = await fetch(url, { method: 'GET', headers: headers(env) });
         if (!res.ok) {
-            console.error(`[supabase] FETCH IN ${table} failed (${res.status})`);
-            return [];
+            // Throw rather than fail open — the caller's retry path is far safer than
+            // silently treating every value as "new" and inserting duplicates.
+            const errText = await res.text().catch(() => '');
+            throw new Error(`[supabase] FETCH IN ${table} failed (${res.status}): ${errText.slice(0, 200)}`);
         }
-        return await res.json() as any[];
-    } catch (err) {
-        console.error(`[supabase] FETCH IN ${table} exception:`, err);
-        return [];
+        out.push(...(await res.json() as any[]));
     }
+    return out;
 }

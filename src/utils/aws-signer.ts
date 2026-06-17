@@ -21,7 +21,7 @@ function toHex(buffer: ArrayBuffer): string {
 async function hmacSha256(key: ArrayBuffer | Uint8Array, message: string): Promise<ArrayBuffer> {
     const cryptoKey = await crypto.subtle.importKey(
         'raw',
-        key instanceof ArrayBuffer ? key : key.buffer,
+        key,
         { name: 'HMAC', hash: 'SHA-256' },
         false,
         ['sign']
