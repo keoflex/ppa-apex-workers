@@ -130,6 +130,9 @@ export function safeJsonParse<T = any>(rawText: string | null | undefined, fallb
         }
     }
 
+    if (cleaned) {
+        console.warn(`⚠️ safeJsonParse failed to parse or repair JSON. Returning fallback. Raw text length: ${cleaned.length}. Preview: ${cleaned.slice(0, 300)}`);
+    }
     return fallback;
 }
 

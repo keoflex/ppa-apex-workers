@@ -260,9 +260,14 @@ Rules:
                 const chunkExtracted = safeJsonParse<ExtractedMeta[]>(jsonStr, []);
                 extracted.push(...chunkExtracted);
             }
-        } catch (err) {
+        } catch (err: any) {
             console.error(`❌ Gemini SEC bulk chunk [${i}-${i + CHUNK_SIZE}] failed:`, err);
             await logGeminiError(env, 'lite-sec-bulk-extraction', 'sense-sec-bulk', err, { itemsCount: chunkHits.length });
+            
+            const errMsg = String(err);
+            if (errMsg.includes('location is not supported') || errMsg.includes('LocationNotSupported')) {
+                throw err;
+            }
         }
     }
     console.log(`📋 Gemini extracted ${extracted.length} SEC bulk entities total`);

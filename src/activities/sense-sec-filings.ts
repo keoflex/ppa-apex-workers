@@ -86,11 +86,12 @@ export async function senseSecFilings(env: Env): Promise<MarketTrigger[]> {
             if (!res.ok) { console.warn(`⚠️ SEC "${query.label}" failed (${res.status})`); continue; }
 
             const data = await res.json() as EdgarSearchResponse;
-            for (const hit of (data?.hits?.hits || [])) {
+            const hits = (data?.hits?.hits || []).slice(0, 5);
+            for (const hit of hits) {
                 allResults.push(hit);
                 queryLabels.push(query.label);
             }
-            console.log(`📜 SEC ${query.label}: ${data?.hits?.hits?.length || 0} filings`);
+            console.log(`📜 SEC ${query.label}: ${hits.length} filings (out of ${data?.hits?.total?.value || 0} total)`);
             await new Promise(r => setTimeout(r, 200)); // polite delay
         } catch (err) {
             console.warn(`⚠️ SEC "${query.label}" exception:`, err);
@@ -121,7 +122,7 @@ export async function senseSecFilingsForQuery(env: Env, query: string): Promise<
         if (!res.ok) { console.warn(`⚠️ SEC mission failed (${res.status})`); return []; }
 
         const data = await res.json() as EdgarSearchResponse;
-        const hits = data?.hits?.hits || [];
+        const hits = (data?.hits?.hits || []).slice(0, 10);
         if (hits.length === 0) return [];
 
         const labels = hits.map(() => 'Mission Search');
@@ -205,9 +206,15 @@ Rules:
             extracted = safeJsonParse<ExtractedMeta[]>(jsonStr, []);
             console.log(`📋 Gemini extracted ${extracted.length} SEC entities (finishReason: ${finishReason || 'STOP'})`);
         }
-    } catch (err) {
+    } catch (err: any) {
         console.error('❌ Gemini SEC extraction failed:', err);
         await logGeminiError(env, 'lite-sec-extraction', 'sense-sec-filings', err, { itemsCount: hits.length });
+        
+        // Rethrow location-related errors so that the outer runner can trigger a retry/warning
+        const errMsg = String(err);
+        if (errMsg.includes('location is not supported') || errMsg.includes('LocationNotSupported')) {
+            throw err;
+        }
         return [];
     }
 

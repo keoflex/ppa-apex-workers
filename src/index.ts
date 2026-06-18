@@ -2727,6 +2727,10 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                             } else {
                                 sourceStats[label] = 0;
                                 console.warn(`⚠️ ${label} failed:`, result.reason);
+                                const reasonStr = String(result.reason || '');
+                                if (reasonStr.includes('location is not supported') || reasonStr.includes('LocationNotSupported')) {
+                                    throw result.reason;
+                                }
                             }
                         }
 
