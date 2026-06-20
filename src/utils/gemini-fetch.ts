@@ -80,15 +80,29 @@ export async function fetchGemini(
                         }
                     } catch (_) {}
                 }
+            } else if (status === 400) {
+                try {
+                    const cloned = res.clone();
+                    const text = await cloned.text();
+                    if (
+                        text.includes('location is not supported') || 
+                        text.includes('LocationNotSupported') || 
+                        text.includes('not supported for the API use')
+                    ) {
+                        isRetryable = true;
+                        errorMessage = `HTTP 400 (User Location Not Supported)`;
+                    }
+                } catch (_) {}
             }
         }
 
         if (isRetryable) {
             const isOverload = errorMessage.includes('503') || errorMessage.includes('429');
+            const isLocationError = errorMessage.includes('User Location Not Supported');
             const currentMaxRetries = isOverload ? maxRetries + 3 : maxRetries;
 
-            // If we have retries left on the current model, do exponential backoff and retry
-            if (attempt <= currentMaxRetries) {
+            // If we have retries left on the current model, do exponential backoff and retry (skip if location block)
+            if (!isLocationError && attempt <= currentMaxRetries) {
                 const backoffMultiplier = isOverload ? 3.0 : 2.0;
                 const baseDelay = Math.pow(backoffMultiplier, attempt) * 1000;
                 const jitter = Math.random() * 3000; // Increased jitter to 3s to prevent synchronized thundering herd
@@ -100,9 +114,9 @@ export async function fetchGemini(
                 continue;
             }
 
-            // Retries exhausted on primary -> Switch to fallback
+            // Retries exhausted on primary OR immediate switch on location error -> Switch to fallback
             if (!fallbackTriggered) {
-                console.warn(`⚠️ Gemini primary ${currentModel} exhausted retries due to error: ${errorMessage}. Falling back to alternative model.`);
+                console.warn(`⚠️ Gemini primary ${currentModel} ${isLocationError ? 'immediately falling back' : 'exhausted retries'} due to error: ${errorMessage}. Falling back to alternative model.`);
                 await logGeminiError(env, currentModel, activityName, new Error(`[Primary Exhausted, Falling Back] ${errorMessage}`));
                 
                 fallbackTriggered = true;

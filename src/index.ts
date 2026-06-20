@@ -20,6 +20,8 @@ import { deduplicateTriggers } from './utils/dedup';
 import { enrichLead, type EnrichedLead } from './activities/enrich-lead';
 import type { DraftInput } from './activities/generate-draft';
 import { generateDraft } from './activities/generate-draft';
+import { generateMobileDraft } from './activities/generate-mobile-draft';
+import { synthesizeMobileResearch } from './activities/synthesize-mobile-research';
 import { queueTerritoryBriefings } from './tasks/generate-briefing';
 import { fetchGemini } from './utils/gemini-fetch';
 import { logGeminiError } from './utils/gemini-logger';
@@ -32,8 +34,54 @@ import { copilotChat, type CopilotRequest } from './activities/copilot-chat';
 import { insertRow, patchRow, fetchRow } from './utils/supabase';
 import { Webhook, WebhookVerificationError } from 'standardwebhooks';
 
+export function normalizeDomain(companyName: string, enrichmentData?: any, sourceUrl?: string | null): string {
+    // 1. Check if enrichment data has a domain
+    let domain = enrichmentData?.company_domain || enrichmentData?.companyDomain || enrichmentData?.domain;
+    if (domain) {
+        domain = domain.trim().toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, '');
+        return domain;
+    }
+    
+    // 2. Try parsing source URL if provided
+    const urlToCheck = sourceUrl || enrichmentData?.trigger_source || enrichmentData?.source_url || enrichmentData?.url;
+    if (urlToCheck) {
+        try {
+            const parsed = new URL(urlToCheck).hostname.replace('www.', '').toLowerCase();
+            if (parsed) return parsed;
+        } catch (_) {}
+    }
+    
+    // 3. Fallback to company name normalization
+    let name = companyName || '';
+    name = name.trim().toLowerCase();
+    
+    // Remove trailing dots
+    while (name.endsWith('.')) {
+        name = name.slice(0, -1);
+    }
+    
+    // Replace all spaces and non-alphanumeric characters, except dots
+    let normalized = name.replace(/[^a-z0-9.]/g, '');
+    
+    // Remove any remaining trailing/double dots
+    normalized = normalized.replace(/\.+$/, '');
+    normalized = normalized.replace(/\.+/g, '.');
+    
+    // Check if it should end with .gov or .com
+    if (normalized.endsWith('.gov') || normalized.endsWith('gov')) {
+        return normalized.replace(/gov$/, '') + '.gov';
+    }
+    
+    if (normalized.endsWith('.com')) {
+        return normalized;
+    }
+    
+    return normalized + '.com';
+}
+
 export interface Env {
     STRIKE_QUEUE: Queue;
+    MOBILE_QUEUE: Queue;
     SUPABASE_URL: string;
     SUPABASE_SERVICE_ROLE_KEY: string;
     GEMINI_API_KEY: string;
@@ -1804,6 +1852,78 @@ Return ONLY a JSON object:
             }
         }
 
+        // Mobile Strike Dispatch Endpoint
+        if (url.pathname === '/api/mobile-dispatch' && request.method === 'POST') {
+            try {
+                const body = await request.json() as {
+                    userId: string;
+                    targetAudience: string;
+                    market: string;
+                    desiredOutcome: string;
+                    informationToGather?: string;
+                    remainingCount: number;
+                    watchlistDomain?: string;
+                    watchlistTrigger?: any;
+                };
+
+                if (!body.userId || !body.targetAudience || !body.market || !body.desiredOutcome) {
+                    return jsonWithCors({ error: 'Missing parameters: userId, targetAudience, market, desiredOutcome' }, { status: 400 });
+                }
+
+                const queueToUse = env.MOBILE_QUEUE || env.STRIKE_QUEUE;
+                if (queueToUse) {
+                    await queueToUse.send({
+                        action: 'mobile_strike_generation',
+                        userId: body.userId,
+                        targetAudience: body.targetAudience,
+                        market: body.market,
+                        desiredOutcome: body.desiredOutcome,
+                        informationToGather: body.informationToGather || '',
+                        remainingCount: body.remainingCount || 1,
+                        watchlistDomain: body.watchlistDomain || null,
+                        watchlistTrigger: body.watchlistTrigger || null,
+                    });
+                    return jsonWithCors({ status: 'queued', userId: body.userId, count: body.remainingCount });
+                }
+
+                return jsonWithCors({ error: 'Queue not available' }, { status: 503 });
+            } catch (error) {
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // Deep-dive a single existing mobile strike (richer research, costs 1 credit).
+        if (url.pathname === '/api/mobile-deep-dive' && request.method === 'POST') {
+            try {
+                const body = await request.json() as { userId: string; strikeId: number };
+                if (!body.userId || !body.strikeId) {
+                    return jsonWithCors({ error: 'Missing userId or strikeId' }, { status: 400 });
+                }
+                const queueToUse = env.MOBILE_QUEUE || env.STRIKE_QUEUE;
+                if (!queueToUse) return jsonWithCors({ error: 'Queue not available' }, { status: 503 });
+                await queueToUse.send({ action: 'mobile_deep_dive', userId: body.userId, strikeId: body.strikeId });
+                return jsonWithCors({ status: 'queued', strikeId: body.strikeId });
+            } catch (error) {
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
+        // Tailor pushed campaign strikes for a client (research + client-tailored draft).
+        if (url.pathname === '/api/mobile-campaign-tailor' && request.method === 'POST') {
+            try {
+                const body = await request.json() as { userId: string; strikeIds: number[] };
+                if (!body.userId || !Array.isArray(body.strikeIds) || body.strikeIds.length === 0) {
+                    return jsonWithCors({ error: 'Missing userId or strikeIds' }, { status: 400 });
+                }
+                const queueToUse = env.MOBILE_QUEUE || env.STRIKE_QUEUE;
+                if (!queueToUse) return jsonWithCors({ error: 'Queue not available' }, { status: 503 });
+                await queueToUse.send({ action: 'mobile_campaign_tailor', userId: body.userId, strikeIds: body.strikeIds });
+                return jsonWithCors({ status: 'queued', count: body.strikeIds.length });
+            } catch (error) {
+                return jsonWithCors({ error: String(error) }, { status: 500 });
+            }
+        }
+
         // Regenerate or Deep Research trigger
         if (url.pathname === '/api/regenerate' && request.method === 'POST') {
             try {
@@ -2625,6 +2745,703 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     continue;
                 }
 
+                // ── Handle mobile_deep_dive (richer research on one existing strike) ──
+                if (msg.body?.action === 'mobile_deep_dive') {
+                    const { userId, strikeId } = msg.body;
+                    try {
+                        const hdr = { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` };
+                        const scRes = await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=eq.${strikeId}&mobile_user_id=eq.${userId}&select=id,mobile_search_label,lead_targets(company,executive_name,executive_title,trigger_event,enrichment_data)`,
+                            { headers: hdr }
+                        );
+                        const scRows = scRes.ok ? await scRes.json() as any[] : [];
+                        if (!scRows.length) { console.warn(`Deep-dive: strike ${strikeId} not found for user ${userId}`); msg.ack(); continue; }
+                        const lt = scRows[0].lead_targets || {};
+                        const ed = lt.enrichment_data || {};
+                        const profileRows = await fetchRow(env, 'mobile_user_profiles', 'id', userId);
+                        const prof = (profileRows && profileRows[0]) || {};
+                        const [aud, mkt] = String(scRows[0].mobile_search_label || ' · ').split(' · ');
+
+                        const research = await synthesizeMobileResearch(env, {
+                            company: lt.company,
+                            industry: ed.industry,
+                            trigger: lt.trigger_event,
+                            enrichmentContext: [
+                                ed.revenue ? `Revenue: ${ed.revenue}` : '',
+                                ed.employees ? `Employees: ${ed.employees}` : '',
+                                Array.isArray(ed.signals) && ed.signals.length ? `Signals: ${ed.signals.join('; ')}` : '',
+                                ed.executive_research ? `Exec background: ${ed.executive_research}` : '',
+                            ].filter(Boolean).join(' | '),
+                            primaryContactName: lt.executive_name,
+                            primaryContactTitle: lt.executive_title,
+                            senderCompany: prof.company_name || '',
+                            senderNarrative: prof.core_services_narrative || '',
+                            targetAudience: aud || '',
+                            market: mkt || '',
+                            desiredOutcome: '',
+                            informationToGather: 'DEEP DIVE — surface the most useful intel available: recent funding/M&A, leadership changes, expansion, hiring, partnerships, and risks; and identify the full buying committee.',
+                            idealCustomerProfile: prof.ideal_customer_profile || '',
+                            exclusions: prof.exclusions || '',
+                        });
+
+                        const contacts = [
+                            { name: lt.executive_name || 'Unknown', title: lt.executive_title || 'Executive', email: ed.email || '', phone: ed.phone || '', linkedin: ed.linkedin_url || '', verified: !!ed.email },
+                            ...research.additionalContacts.map(c => ({ name: c.name, title: c.title, email: '', phone: '', linkedin: '', verified: false })),
+                        ];
+                        await patchRow(env, 'strike_campaigns', {
+                            mobile_relevance_score: research.relevanceScore,
+                            mobile_relevance_reason: research.relevanceReason,
+                            mobile_research_findings: JSON.stringify(research.researchFindings),
+                            mobile_contacts: JSON.stringify(contacts),
+                        }, 'id', strikeId);
+
+                        const balRows = await fetchRow(env, 'mobile_strike_balances', 'user_id', userId);
+                        const cur = balRows && balRows[0] ? balRows[0] : null;
+                        if (cur) await patchRow(env, 'mobile_strike_balances', { credits_used: (cur.credits_used || 0) + 1, updated_at: new Date().toISOString() }, 'user_id', userId);
+
+                        console.log(`🔬 Deep-dive complete for strike #${strikeId} (user ${userId}).`);
+                        msg.ack();
+                    } catch (deepErr) {
+                        console.error('❌ Deep-dive failed:', deepErr);
+                        msg.retry();
+                    }
+                    continue;
+                }
+
+                // ── Handle mobile_campaign_tailor (research + client-tailored draft for pushed strikes) ──
+                if (msg.body?.action === 'mobile_campaign_tailor') {
+                    const { userId, strikeIds } = msg.body;
+                    try {
+                        const hdr = { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` };
+                        const profileRows = await fetchRow(env, 'mobile_user_profiles', 'id', userId);
+                        const prof = (profileRows && profileRows[0]) || {};
+                        for (const strikeId of (strikeIds || [])) {
+                            try {
+                                const scRes = await fetch(
+                                    `${env.SUPABASE_URL}/rest/v1/strike_campaigns?id=eq.${strikeId}&mobile_user_id=eq.${userId}&select=id,mobile_search_label,lead_targets(company,executive_name,executive_title,trigger_event,enrichment_data)`,
+                                    { headers: hdr }
+                                );
+                                const scRows = scRes.ok ? await scRes.json() as any[] : [];
+                                if (!scRows.length) continue;
+                                const lt = scRows[0].lead_targets || {};
+                                const ed = lt.enrichment_data || {};
+                                const [aud, mkt] = String(scRows[0].mobile_search_label || ' · ').split(' · ');
+                                const enrichmentContext = [
+                                    ed.revenue ? `Revenue: ${ed.revenue}` : '',
+                                    ed.employees ? `Employees: ${ed.employees}` : '',
+                                    Array.isArray(ed.signals) && ed.signals.length ? `Signals: ${ed.signals.join('; ')}` : '',
+                                    ed.executive_research ? `Exec background: ${ed.executive_research}` : '',
+                                ].filter(Boolean).join(' | ');
+
+                                const research = await synthesizeMobileResearch(env, {
+                                    company: lt.company, industry: ed.industry, trigger: lt.trigger_event,
+                                    enrichmentContext, primaryContactName: lt.executive_name, primaryContactTitle: lt.executive_title,
+                                    senderCompany: prof.company_name || '', senderNarrative: prof.core_services_narrative || '',
+                                    targetAudience: aud || '', market: mkt || '', desiredOutcome: '',
+                                    informationToGather: 'Surface the most useful intel and the full buying committee for this shared opportunity.',
+                                    idealCustomerProfile: prof.ideal_customer_profile || '', exclusions: prof.exclusions || '',
+                                });
+                                const draft = await generateMobileDraft(env, {
+                                    lead: { executiveName: lt.executive_name, executiveTitle: lt.executive_title } as any,
+                                    senderName: prof.full_name || '', senderCompany: prof.company_name || '',
+                                    senderNarrative: prof.core_services_narrative || '', desiredOutcome: '',
+                                    targetCompany: lt.company, triggerContext: lt.trigger_event || '',
+                                });
+                                const contacts = [
+                                    { name: lt.executive_name || 'Unknown', title: lt.executive_title || 'Executive', email: ed.email || '', phone: ed.phone || '', linkedin: ed.linkedin_url || '', verified: !!ed.email },
+                                    ...research.additionalContacts.map(c => ({ name: c.name, title: c.title, email: '', phone: '', linkedin: '', verified: false })),
+                                ];
+                                await patchRow(env, 'strike_campaigns', {
+                                    email_subject: draft.subject,
+                                    drafted_body: draft.body,
+                                    mobile_relevance_score: research.relevanceScore,
+                                    mobile_relevance_reason: research.relevanceReason,
+                                    mobile_research_findings: JSON.stringify(research.researchFindings),
+                                    mobile_contacts: JSON.stringify(contacts),
+                                }, 'id', strikeId);
+                            } catch (oneErr) {
+                                console.error(`Campaign-tailor strike ${strikeId} failed:`, oneErr);
+                            }
+                        }
+                        console.log(`🎁 Campaign push tailored ${(strikeIds || []).length} strikes for user ${userId}.`);
+                        msg.ack();
+                    } catch (tailErr) {
+                        console.error('❌ Campaign tailor failed:', tailErr);
+                        msg.retry();
+                    }
+                    continue;
+                }
+
+                // ── Handle mobile_strike_generation ──
+                if (msg.body?.action === 'mobile_strike_generation') {
+                    const { userId, targetAudience, market, desiredOutcome, informationToGather, remainingCount, watchlistDomain, watchlistTrigger } = msg.body;
+                    console.log(`📱 Priority Mobile Strike Generation: User #${userId} | Audience: ${targetAudience} | Market: ${market} | Limit: ${remainingCount}`);
+
+                    try {
+                        // 1. Fetch user onboarding profile for service narrative & details
+                        const profileRows = await fetchRow(env, 'mobile_user_profiles', 'id', userId);
+                        if (!profileRows || profileRows.length === 0) {
+                            console.error(`❌ Mobile profile not found for user ${userId}`);
+                            msg.ack();
+                            continue;
+                        }
+                        const profile = profileRows[0];
+                        const servicesNarrative = profile.core_services_narrative;
+                        const companyName = profile.company_name;
+
+                        // LEARNING LOOP: bias discovery toward companies the user has previously SAVED.
+                        let learningHint = '';
+                        try {
+                            const savedRes = await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/strike_campaigns?mobile_user_id=eq.${userId}&mobile_feedback_status=eq.approved&select=lead_targets(company)&order=mobile_delivered_at.desc.nullslast&limit=12`,
+                                { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                            );
+                            if (savedRes.ok) {
+                                const saved = await savedRes.json() as any[];
+                                const names = saved.map(r => r.lead_targets?.company).filter(Boolean).slice(0, 12);
+                                if (names.length) {
+                                    learningHint = `The user has previously SAVED these as strong matches — strongly prefer companies similar in sector/size/type: ${names.join(', ')}.`;
+                                    console.log(`🧠 Learning loop: ${names.length} saved examples informing discovery for User #${userId}.`);
+                                }
+                            }
+                        } catch (learnErr) {
+                            console.warn('⚠️ Learning-loop fetch failed (non-fatal):', learnErr);
+                        }
+
+                        const uniqueResults: any[] = [];
+
+                        if (watchlistDomain && watchlistTrigger) {
+                            console.log(`🎯 Watchlist triggered for User #${userId} on domain: ${watchlistDomain}`);
+                            uniqueResults.push({
+                                companyName: watchlistTrigger.company || watchlistDomain.split('.')[0],
+                                companyDomain: watchlistDomain,
+                                executiveName: watchlistTrigger.executiveName || 'Unknown',
+                                executiveTitle: watchlistTrigger.executiveTitle || 'Key Decision-Maker',
+                                triggerEvent: watchlistTrigger.headline || watchlistTrigger.articleText || `Watchlist signal detected for ${watchlistDomain}.`,
+                                triggerSource: watchlistTrigger.sourceUrl || null,
+                                dataSource: watchlistTrigger.source || 'Watchlist Monitor'
+                            });
+                        } else {
+                            // 2. Generate search queries optimized for Exa
+                            const queryGenSystem = `You are a search query engineering expert. Given a target audience and a geographic market, generate 2 optimized search queries for Exa.ai (neural search engine) to find target companies and their websites.
+Keep them simple, using natural language or neural-search friendly phrases.
+Return EXACTLY a JSON object with a "queries" array:
+{
+  "queries": ["query 1", "query 2"]
+}`;
+                            const queryGenPrompt = `Target Audience: ${targetAudience}\nMarket: ${market}`;
+                            
+                            let queries = [`companies matching ${targetAudience} in ${market}`];
+                            try {
+                                const geminiRes = await fetchGemini(env, 'lite', {
+                                    activityName: 'mobile-query-generation',
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        system_instruction: { parts: [{ text: queryGenSystem }] },
+                                        contents: [{ role: 'user', parts: [{ text: queryGenPrompt }] }],
+                                        generationConfig: {
+                                            temperature: 0.2,
+                                            maxOutputTokens: 200,
+                                            responseMimeType: 'application/json',
+                                        }
+                                    })
+                                });
+                                if (geminiRes.ok) {
+                                    const parsed = await safeGeminiResponseParse(geminiRes);
+                                    const parsedJson = JSON.parse(parsed.text || '{}');
+                                    if (Array.isArray(parsedJson.queries) && parsedJson.queries.length > 0) {
+                                        queries = parsedJson.queries;
+                                    }
+                                }
+                            } catch (err) {
+                                console.warn('⚠️ Gemini query generation failed, using fallback query:', err);
+                            }
+
+                            console.log(`📡 Exa search queries generated: ${JSON.stringify(queries)}`);
+
+                            // 3. Search Exa & Free Resources for matching companies in parallel
+                            const allExaResults: any[] = [];
+                            const freeTriggers: any[] = [];
+
+                            // Over-fetch candidates so that after dedup + enrichment failures we still
+                            // have enough fresh targets to fill the requested count.
+                            const exaPerQuery = Math.max(remainingCount * 3, 30);
+                            console.log(`🔑 EXA_API_KEY ${env.EXA_API_KEY ? 'present' : 'MISSING — Exa will return nothing'}; requesting ${exaPerQuery} results/query for ${remainingCount} target(s)`);
+
+                            for (const query of queries) {
+                                try {
+                                    const exaPromise = fetch('https://api.exa.ai/search', {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            'x-api-key': env.EXA_API_KEY || '',
+                                        },
+                                        body: JSON.stringify({
+                                            query,
+                                            numResults: exaPerQuery,
+                                            type: 'neural',
+                                            useAutoprompt: true,
+                                            excludeDomains: ['wikipedia.org', 'reddit.com', 'quora.com', 'investopedia.com'],
+                                            contents: {
+                                                text: { maxCharacters: 1000 }
+                                            }
+                                        })
+                                    });
+
+                                    const freePromise = Promise.allSettled([
+                                        senseSecBulkForQuery(env, query),
+                                        senseFederalRegisterForQuery(env, query),
+                                        senseWarnDirectForQuery(env, query),
+                                        senseUsptoDirectForQuery(env, query),
+                                    ]);
+
+                                    const [exaRes, freeRes] = await Promise.all([exaPromise, freePromise]);
+
+                                    if (exaRes.ok) {
+                                        const data = await exaRes.json() as any;
+                                        const got = data?.results?.length || 0;
+                                        console.log(`📡 Exa "${query}" → ${got} results`);
+                                        if (data?.results) {
+                                            allExaResults.push(...data.results);
+                                        }
+                                    } else {
+                                        const errBody = await exaRes.text().catch(() => '');
+                                        console.error(`❌ Exa search "${query}" failed: HTTP ${exaRes.status} ${errBody.slice(0, 300)}`);
+                                    }
+
+                                    let freeCount = 0;
+                                    freeRes.forEach(r => {
+                                        if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+                                            freeCount += r.value.length;
+                                            freeTriggers.push(...r.value);
+                                        }
+                                    });
+                                    console.log(`🏛️ Free sensors "${query}" → ${freeCount} triggers`);
+                                } catch (err) {
+                                    console.warn(`⚠️ Search failed for query "${query}":`, err);
+                                }
+                            }
+                            console.log(`📊 Mobile search totals: ${allExaResults.length} Exa + ${freeTriggers.length} free triggers (before dedup)`);
+
+                            // Gemini company discovery — audience-matched REAL companies. This is the
+                            // relevance backstop: when Exa is unavailable/insufficient, government-filing
+                            // sensors alone return off-target entities (funds, SPACs) that don't match the
+                            // requested audience. Gemini supplies actual companies that fit the brief.
+                            const geminiCompanies: any[] = [];
+                            try {
+                                const discSystem = `You are a B2B prospecting engine. Given a target audience and a market/geography, list REAL, currently-operating companies that genuinely match. Return ONLY a JSON object: {"companies":[{"name":"Company Name","domain":"company.com","reason":"one short reason they fit"}]}. Use real companies and their real primary website domain. Do NOT return SEC filing entities, investment funds, or SPACs unless the audience explicitly asks for them.`;
+                                // Cap the count so the JSON response can't truncate; over-fill modestly.
+                                const discCount = Math.min(Math.max(remainingCount + 5, 12), 25);
+                                const discPrompt = `Target audience: ${targetAudience}\nMarket / geography: ${market}\nDesired outcome: ${desiredOutcome}\nInformation focus: ${informationToGather || 'general fit'}\n${profile.ideal_customer_profile ? `Ideal customer profile: ${profile.ideal_customer_profile}\n` : ''}${profile.exclusions ? `AVOID: ${profile.exclusions}\n` : ''}${learningHint ? learningHint + '\n' : ''}Return up to ${discCount} companies.`;
+                                const discRes = await fetchGemini(env, 'lite', {
+                                    activityName: 'mobile-company-discovery',
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        system_instruction: { parts: [{ text: discSystem }] },
+                                        contents: [{ role: 'user', parts: [{ text: discPrompt }] }],
+                                        generationConfig: {
+                                            temperature: 0.4,
+                                            maxOutputTokens: 4096,
+                                            responseMimeType: 'application/json',
+                                            responseSchema: {
+                                                type: 'OBJECT',
+                                                properties: {
+                                                    companies: {
+                                                        type: 'ARRAY',
+                                                        items: {
+                                                            type: 'OBJECT',
+                                                            properties: {
+                                                                name: { type: 'STRING' },
+                                                                domain: { type: 'STRING' },
+                                                                reason: { type: 'STRING' },
+                                                            },
+                                                            required: ['name'],
+                                                        },
+                                                    },
+                                                },
+                                                required: ['companies'],
+                                            },
+                                        },
+                                    }),
+                                });
+                                if (discRes.ok) {
+                                    const { text: discText, finishReason } = await safeGeminiResponseParse(discRes);
+                                    // safeJsonParse repairs minor truncation; log if the model hit the token ceiling.
+                                    if (finishReason === 'MAX_TOKENS') console.warn('⚠️ Gemini discovery hit MAX_TOKENS — parsing what we got.');
+                                    const json = safeJsonParse<{ companies?: any[] }>(discText || '', { companies: [] });
+                                    if (Array.isArray(json?.companies)) geminiCompanies.push(...json.companies);
+                                } else {
+                                    console.error(`❌ Gemini discovery failed: HTTP ${discRes.status}`);
+                                }
+                                console.log(`🤖 Gemini discovery → ${geminiCompanies.length} candidate companies`);
+                            } catch (discErr) {
+                                console.warn('⚠️ Gemini company discovery failed:', discErr);
+                            }
+
+                            // Deduplicate and merge targets. Priority order = Exa → Gemini discovery →
+                            // free government sensors, so audience-relevant sources fill the requested
+                            // count first and noisy filing data is only used to top up leftover slots.
+                            const seenDomains = new Set<string>();
+
+                            // Parse Exa search results
+                            for (const result of allExaResults) {
+                                try {
+                                    const domain = normalizeDomain(result.title || '', null, result.url);
+                                    if (!seenDomains.has(domain)) {
+                                        seenDomains.add(domain);
+                                        uniqueResults.push({
+                                            companyName: result.title ? result.title.split('-')[0].split('|')[0].trim() : domain.split('.')[0],
+                                            companyDomain: domain,
+                                            executiveName: 'Unknown',
+                                            executiveTitle: 'Key Decision-Maker',
+                                            triggerEvent: result.text || `Target matching ${targetAudience} located via Exa.ai.`,
+                                            triggerSource: result.url || null,
+                                            dataSource: 'Exa.ai Mobile Search'
+                                        });
+                                    }
+                                } catch (_) {}
+                            }
+
+                            // Parse Gemini-discovered companies (audience-matched, second priority)
+                            for (const g of geminiCompanies) {
+                                try {
+                                    const company = (g.name || '').trim();
+                                    if (!company) continue;
+                                    const domain = normalizeDomain(company, g.domain ? { company_domain: g.domain } : null);
+                                    if (!seenDomains.has(domain)) {
+                                        seenDomains.add(domain);
+                                        uniqueResults.push({
+                                            companyName: company,
+                                            companyDomain: domain,
+                                            executiveName: 'Unknown',
+                                            executiveTitle: 'Key Decision-Maker',
+                                            triggerEvent: g.reason || `Strong fit for target audience "${targetAudience}" in ${market}.`,
+                                            triggerSource: null,
+                                            dataSource: 'Gemini Discovery'
+                                        });
+                                    }
+                                } catch (_) {}
+                            }
+
+                            // Parse free triggers
+                            for (const trg of freeTriggers) {
+                                try {
+                                    // Derive the TARGET company's domain from its name — never from the
+                                    // data-source URL (that yielded sec.gov / federalregister.gov). The
+                                    // enrichment step below can still upgrade this to a verified domain.
+                                    let domain = normalizeDomain(trg.company, null, null);
+                                    if (!seenDomains.has(domain)) {
+                                        seenDomains.add(domain);
+                                        uniqueResults.push({
+                                            companyName: trg.company,
+                                            companyDomain: domain,
+                                            executiveName: trg.executiveName || 'Unknown',
+                                            executiveTitle: trg.executiveTitle || 'Key Decision-Maker',
+                                            triggerEvent: trg.headline || trg.articleText || `Opportunity discovered in public records: ${trg.source}`,
+                                            triggerSource: trg.sourceUrl || null,
+                                            dataSource: trg.source || 'Free Register Scrape'
+                                        });
+                                    }
+                                } catch (_) {}
+                            }
+                        }
+
+                        console.log(`🧹 Unified search found ${uniqueResults.length} unique domains (Exa → Gemini discovery → Free Government/State Sensors, in priority order).`);
+
+                        // 4. Fetch already delivered domains for this user to deduplicate
+                        const deliveredRes = await fetch(
+                            `${env.SUPABASE_URL}/rest/v1/mobile_delivered_strikes_log?user_id=eq.${userId}&select=company_domain`,
+                            { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                        );
+                        const deliveredLogs = deliveredRes.ok ? await deliveredRes.json() as any[] : [];
+                        const deliveredDomains = new Set(deliveredLogs.map(l => l.company_domain.toLowerCase()));
+
+                        // Filter out already delivered domains
+                        const freshResults = uniqueResults.filter(r => !deliveredDomains.has(r.companyDomain));
+                        console.log(`🆕 ${freshResults.length} targets are fresh for User #${userId}`);
+
+                        // 5. Generate strikes up to remainingCount.
+                        // billableCount only counts HIGH-CONFIDENCE (audience-matched) sources — Exa and
+                        // Gemini discovery. Low-confidence free-register fills are delivered as a bonus
+                        // but NOT charged, so the user is never billed for off-audience results.
+                        let generatedCount = 0;
+                        let billableCount = 0;
+                        for (const target of freshResults) {
+                            if (generatedCount >= remainingCount) break;
+
+                            const isHighConfidence = target.dataSource === 'Exa.ai Mobile Search'
+                                || target.dataSource === 'Gemini Discovery';
+
+                            const companyDomain = target.companyDomain;
+                            const companyCleanName = target.companyName;
+
+                            console.log(`⚡ Processing fresh target company: ${companyCleanName} (${companyDomain})`);
+
+                            // Check if company exists in lead_targets already
+                            const existingLeadRes = await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/lead_targets?company=ilike.${encodeURIComponent(companyCleanName)}&select=id,executive_name,executive_title,enrichment_data`,
+                                { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                            );
+                            const existingLeads = existingLeadRes.ok ? await existingLeadRes.json() as any[] : [];
+                            
+                            let leadId: number | null = null;
+                            let enrichedLead: any = null;
+
+                            if (existingLeads.length > 0) {
+                                const lead = existingLeads[0];
+                                leadId = lead.id;
+                                const ed = lead.enrichment_data || {};
+                                enrichedLead = {
+                                    company: lead.company,
+                                    executiveName: lead.executive_name,
+                                    executiveTitle: lead.executive_title,
+                                    companyRevenue: ed.revenue || 'Unknown',
+                                    employeeCount: ed.employees || 'Unknown',
+                                    companyDomain: ed.companyDomain || ed.company_domain || companyDomain,
+                                    signals: ed.signals || [],
+                                    linkedinUrl: ed.linkedin_url || '',
+                                    email: ed.email || '',
+                                    phone: ed.phone || '',
+                                    emailConfidence: ed.emailConfidence || 'none',
+                                    emailSource: ed.emailSource || '',
+                                    executiveResearch: ed.executive_research || '',
+                                };
+                            } else {
+                                // Run full multi-layer enrichment pipeline
+                                try {
+                                    enrichedLead = await enrichLead(env, {
+                                        company: companyCleanName,
+                                        executiveName: target.executiveName || 'Unknown',
+                                        executiveTitle: target.executiveTitle || 'Key Decision-Maker',
+                                    });
+                                } catch (enrichErr) {
+                                    console.warn(`⚠️ Enrichment failed for ${companyCleanName}:`, enrichErr);
+                                    enrichedLead = {
+                                        company: companyCleanName,
+                                        executiveName: target.executiveName || 'Key Decision-Maker',
+                                        executiveTitle: target.executiveTitle || 'Executive',
+                                        companyRevenue: 'Unknown',
+                                        employeeCount: 'Unknown',
+                                        companyDomain,
+                                        signals: [],
+                                        linkedinUrl: '',
+                                    };
+                                }
+                            }
+
+                            // Resolve the best real company domain: prefer the enrichment-verified
+                            // domain, then the candidate's own domain (real for Exa, name-derived for
+                            // free-register hits). Never the data-source domain.
+                            const resolvedDomain = (
+                                (enrichedLead?.companyDomain && enrichedLead.companyDomain.trim())
+                                || (companyDomain && companyDomain.trim())
+                                || normalizeDomain(companyCleanName, null)
+                            );
+
+                            // Save to lead_targets if it's new
+                            if (!leadId) {
+                                const targetRes = await insertRow(env, 'lead_targets', {
+                                    company: enrichedLead.company || companyCleanName,
+                                    executive_name: enrichedLead.executiveName || 'Key Decision-Maker',
+                                    executive_title: enrichedLead.executiveTitle || 'Executive',
+                                    trigger_event: target.triggerEvent || `Target matching ${targetAudience} located via Exa.ai.`,
+                                    trigger_source: target.triggerSource || null,
+                                    trigger_relevance: 90,
+                                    enrichment_data: {
+                                        data_source: target.dataSource,
+                                        revenue: enrichedLead.companyRevenue,
+                                        employees: enrichedLead.employeeCount,
+                                        signals: enrichedLead.signals,
+                                        linkedin_url: enrichedLead.linkedinUrl,
+                                        email: enrichedLead.email || '',
+                                        phone: enrichedLead.phone || '',
+                                        company_domain: resolvedDomain,
+                                        companyDomain: resolvedDomain,
+                                        email_confidence: enrichedLead.emailConfidence || 'none',
+                                        emailConfidence: enrichedLead.emailConfidence || 'none',
+                                        email_source: enrichedLead.emailSource || '',
+                                        emailSource: enrichedLead.emailSource || '',
+                                        executive_research: enrichedLead.executiveResearch || '',
+                                        trigger_summary: target.triggerEvent || '',
+                                        source: 'gemini+apollo+exa',
+                                        enriched_at: new Date().toISOString(),
+                                    },
+                                });
+                                if (targetRes.ok && targetRes.data?.[0]) {
+                                    leadId = targetRes.data[0].id;
+                                }
+                            }
+
+                            if (!leadId) {
+                                console.error(`❌ Failed to resolve lead target ID for ${companyCleanName}`);
+                                continue;
+                            }
+
+                            // Research synthesis: real relevance score, findings that answer the user's
+                            // information request, and the wider buying committee. This is what makes the
+                            // strike a research deliverable rather than a single lead.
+                            const enrichmentContext = [
+                                enrichedLead.companyRevenue && enrichedLead.companyRevenue !== 'Unknown' ? `Revenue: ${enrichedLead.companyRevenue}` : '',
+                                enrichedLead.employeeCount && enrichedLead.employeeCount !== 'Unknown' ? `Employees: ${enrichedLead.employeeCount}` : '',
+                                Array.isArray(enrichedLead.signals) && enrichedLead.signals.length ? `Signals: ${enrichedLead.signals.join('; ')}` : '',
+                                enrichedLead.executiveResearch ? `Exec background: ${enrichedLead.executiveResearch}` : '',
+                            ].filter(Boolean).join(' | ');
+
+                            const research = await synthesizeMobileResearch(env, {
+                                company: companyCleanName,
+                                industry: (enrichedLead as any).industry,
+                                trigger: target.triggerEvent || '',
+                                enrichmentContext,
+                                primaryContactName: enrichedLead.executiveName,
+                                primaryContactTitle: enrichedLead.executiveTitle,
+                                senderCompany: companyName,
+                                senderNarrative: servicesNarrative || '',
+                                targetAudience,
+                                market,
+                                desiredOutcome,
+                                informationToGather: informationToGather || '',
+                                idealCustomerProfile: profile.ideal_customer_profile || '',
+                                exclusions: profile.exclusions || '',
+                            });
+
+                            // Build the contact list: the Apollo-enriched primary (verified) plus the
+                            // additional decision-makers from synthesis (suggested, not verified).
+                            const contacts = [
+                                {
+                                    name: enrichedLead.executiveName || 'Unknown',
+                                    title: enrichedLead.executiveTitle || 'Executive',
+                                    email: enrichedLead.email || '',
+                                    phone: enrichedLead.phone || '',
+                                    linkedin: enrichedLead.linkedinUrl || '',
+                                    verified: !!enrichedLead.email,
+                                },
+                                ...research.additionalContacts.map(c => ({
+                                    name: c.name, title: c.title, email: '', phone: '', linkedin: '', verified: false,
+                                })),
+                            ];
+
+                            // Generate the outreach draft with the MOBILE-ONLY generator. This is fully
+                            // isolated from the Polsinelli web engine: the sender is the mobile user and
+                            // the email must never reference Polsinelli or any third party.
+                            const draft = await generateMobileDraft(env, {
+                                lead: enrichedLead,
+                                senderName: profile.full_name || '', // person's name only — never the company
+                                senderCompany: companyName,
+                                senderNarrative: servicesNarrative || '',
+                                desiredOutcome,
+                                targetCompany: companyCleanName,
+                                triggerContext: target.triggerEvent || '',
+                            });
+
+                            // Save to strike_campaigns. mobile_user_id is the durable, exact ownership
+                            // key the mobile results endpoint filters on (no more domain-string guessing).
+                            const workflowId = `wf-mob-${crypto.randomUUID().slice(0, 12)}`;
+                            const strikeCampaignRes = await insertRow(env, 'strike_campaigns', {
+                                target_id: leadId,
+                                status: 'pending_hitl', // Set to pending review so it's completed and ready
+                                persona_used: profile.full_name || companyName,
+                                email_subject: draft.subject,
+                                email_subject_b: (draft as any).subjectB || null,
+                                drafted_body: draft.body,
+                                workflow_id: workflowId,
+                                campaign_id: null, // Mobile independent strike
+                                mobile_user_id: userId,
+                                mobile_delivered_at: new Date().toISOString(),
+                                // Human-readable label of the search that produced this strike, so the
+                                // app can group results by request ("audience · market").
+                                mobile_search_label: [targetAudience, market].filter(Boolean).join(' · '),
+                                // Research deliverable: real relevance, findings, and the buying committee.
+                                mobile_relevance_score: research.relevanceScore,
+                                mobile_relevance_reason: research.relevanceReason,
+                                mobile_research_findings: JSON.stringify(research.researchFindings),
+                                mobile_contacts: JSON.stringify(contacts),
+                            });
+
+                            let strikeCampaignId: number | null = null;
+                            if (strikeCampaignRes.ok && strikeCampaignRes.data?.[0]) {
+                                strikeCampaignId = strikeCampaignRes.data[0].id;
+                            }
+
+                            // Record the resolved real domain for per-user dedup on future runs.
+                            await insertRow(env, 'mobile_delivered_strikes_log', {
+                                user_id: userId,
+                                company_domain: resolvedDomain,
+                                delivered_at: new Date().toISOString()
+                            });
+
+                            generatedCount++;
+                            if (isHighConfidence) billableCount++;
+                            console.log(`✅ Priority strike generated for ${companyCleanName} (${companyDomain}) [${isHighConfidence ? 'billable' : 'bonus/unbilled'}] → User #${userId}`);
+
+                            // Dispatch push notification if APNS device token is configured
+                            if (profile.apns_device_token) {
+                                try {
+                                    const { sendApnsNotification } = await import('./utils/apns');
+                                    await sendApnsNotification(
+                                        env,
+                                        profile.apns_device_token,
+                                        `New Opportunity: ${companyCleanName}`,
+                                        `We identified a high relevance business opportunity with ${companyCleanName}. Tap to draft outreach.`,
+                                        {
+                                            strikeId: strikeCampaignId,
+                                            companyDomain: resolvedDomain
+                                        }
+                                    );
+                                } catch (apnsErr) {
+                                    console.error('❌ Failed to trigger APNS push notification:', apnsErr);
+                                }
+                            }
+                        }
+
+                        // Charge ONLY for high-confidence (audience-matched) deliveries — never for
+                        // low-confidence free-register bonus fills. Dispatch deducts nothing up front.
+                        if (billableCount > 0) {
+                            try {
+                                const balRows = await fetchRow(env, 'mobile_strike_balances', 'user_id', userId);
+                                const current = balRows && balRows[0] ? balRows[0] : null;
+                                if (current) {
+                                    await patchRow(env, 'mobile_strike_balances', {
+                                        credits_used: (current.credits_used || 0) + billableCount,
+                                        updated_at: new Date().toISOString(),
+                                    }, 'user_id', userId);
+                                }
+                            } catch (creditErr) {
+                                console.error('❌ Failed to update mobile credit balance:', creditErr);
+                            }
+                        }
+
+                        // Log a MISSED opportunity when no on-audience (high-confidence) targets were
+                        // found, so the team can source options from the web dashboard later. Captures
+                        // exactly what the user asked for. (Best-effort — table may not exist yet.)
+                        if (billableCount === 0) {
+                            try {
+                                await insertRow(env, 'mobile_missed_strikes', {
+                                    user_id: userId,
+                                    target_audience: targetAudience,
+                                    market,
+                                    desired_outcome: desiredOutcome,
+                                    information_requested: informationToGather || null,
+                                    requested_count: remainingCount,
+                                    candidates_found: generatedCount, // low-confidence bonus fills, if any
+                                    created_at: new Date().toISOString(),
+                                });
+                                console.log(`📝 Logged missed strike request for User #${userId} (audience="${targetAudience}", market="${market}").`);
+                            } catch (missErr) {
+                                console.error('❌ Failed to log missed strike:', missErr);
+                            }
+                        }
+
+                        console.log(`📱 Priority Mobile Strike Generation complete: ${generatedCount}/${remainingCount} delivered, ${billableCount} billed (${generatedCount - billableCount} unbilled bonus).`);
+                        msg.ack();
+                    } catch (queueErr) {
+                        console.error('❌ Priority Mobile Strike Generation queue failed:', queueErr);
+                        msg.retry();
+                    }
+                    continue;
+                }
+
                 const { campaignId, persona, workflowId: regenerateWorkflowId, action, steeringNotes } = msg.body;
                 console.log(`📨 Queue processing: Campaign #${campaignId} | Persona: ${persona} | Action: ${action || 'new'}`);
 
@@ -2739,6 +3556,70 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         // Deduplicate across all sources
                         const dedupedTriggers = deduplicateTriggers(allTriggers);
                         console.log(`🧹 After cross-source dedup: ${dedupedTriggers.length} unique`);
+
+                        // ── Check Watchlist Monitored Domains ──
+                        try {
+                            const monitoredRes = await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/mobile_monitored_domains?select=user_id,domain`,
+                                { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                            );
+                            if (monitoredRes.ok) {
+                                const monitored = await monitoredRes.json() as any[];
+                                if (monitored && monitored.length > 0) {
+                                    console.log(`👁️ Checking ${dedupedTriggers.length} unique triggers against ${monitored.length} watchlisted domains...`);
+                                    
+                                    // Build map of domain -> Set of userIds
+                                    const domainUserMap = new Map<string, Set<string>>();
+                                    for (const m of monitored) {
+                                        const cleanDomain = (m.domain || '').trim().toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, '');
+                                        if (cleanDomain) {
+                                            if (!domainUserMap.has(cleanDomain)) {
+                                                domainUserMap.set(cleanDomain, new Set());
+                                            }
+                                            domainUserMap.get(cleanDomain)!.add(m.user_id);
+                                        }
+                                    }
+
+                                    // Check triggers
+                                    let watchlistMatches = 0;
+                                    for (const trigger of dedupedTriggers) {
+                                        // Infer domain
+                                        let domain = normalizeDomain(trigger.company || '', null, trigger.sourceUrl);
+
+                                        const matchingUserIds = domainUserMap.get(domain);
+                                        if (matchingUserIds) {
+                                            for (const userId of matchingUserIds) {
+                                                // Check if already delivered to this user
+                                                const checkDelivered = await fetch(
+                                                    `${env.SUPABASE_URL}/rest/v1/mobile_delivered_strikes_log?user_id=eq.${userId}&company_domain=eq.${domain}&select=id`,
+                                                    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                                                );
+                                                const delivered = checkDelivered.ok ? await checkDelivered.json() as any[] : [];
+                                                if (delivered.length === 0) {
+                                                    console.log(`🎯 WATCHLIST MATCH: Trigger for "${domain}" matches User #${userId}! Queueing priority strike...`);
+                                                    if (env.MOBILE_QUEUE) {
+                                                        await env.MOBILE_QUEUE.send({
+                                                            userId,
+                                                            targetAudience: 'Watchlist Alert',
+                                                            market: 'Global',
+                                                            desiredOutcome: 'Alert',
+                                                            informationToGather: 'Watchlist Signal',
+                                                            remainingCount: 1,
+                                                            watchlistDomain: domain,
+                                                            watchlistTrigger: trigger
+                                                        });
+                                                        watchlistMatches++;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    console.log(`👁️ Watchlist sweep complete. Queued ${watchlistMatches} priority alert generation messages.`);
+                                }
+                            }
+                        } catch (watchlistErr) {
+                            console.error('❌ Watchlist matching failed:', watchlistErr);
+                        }
 
                         // Check against existing DB to skip known companies
                         let newTriggers: MarketTrigger[] = dedupedTriggers;
@@ -3299,6 +4180,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 let partnerProfiles: any[] = [];
                 let campaignObjective: string | undefined = undefined;
                 let agentCampaigns: Array<{ id: string, objective?: string, partners: any[] }> = [];
+                let maxLeads = 5;
 
                 if (action === 'dispatch_agent' && msg.body.agentId) {
                     const { fetchRow, patchRow } = await import('./utils/supabase');
@@ -3309,6 +4191,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         continue;
                     }
                     const agent = agentRows[0];
+                    maxLeads = agent.max_leads_per_run || 5;
 
                     // Create a pipeline_run record for agent dispatches so results are visible in the UI
                     if (!msg.body.runId) {
@@ -3459,11 +4342,12 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     // Search Mission: fan out to ALL 4 sources in parallel
                     console.log(`🎯 Processing search mission: "${msg.body.searchQuery}"`);
                     const searchQuery = msg.body.searchQuery;
+                    maxLeads = msg.body.maxResults || 5;
                     const virtualAgent = {
                         id: 0,
                         name: 'Search Mission',
                         exa_query: searchQuery,
-                        max_leads_per_run: msg.body.maxResults || 5,
+                        max_leads_per_run: maxLeads,
                     };
 
                     // Fan out to ALL sources in parallel — paid + FREE sensors
@@ -3555,6 +4439,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     const t = msg.body.trigger as MarketTrigger;
                     console.log(`📡 Processing external trigger: ${t.company} (${t.source})`);
                     triggers = [t];
+                    maxLeads = 1;
                 } else if (action) {
                     // Unknown action: ack and drop. Never let an unrecognized action fall through to
                     // the global sense pipeline — that burns Exa credits and inserts unrelated leads.
@@ -3569,6 +4454,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                         msg.ack();
                         continue;
                     }
+                    maxLeads = 5;
                 }
 
                 // Process ALL non-duplicate triggers (N+1 query fixed)
@@ -3600,9 +4486,10 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     continue;
                 }
 
-                console.log(`🎯 Processing ${newTriggers.length} new triggers out of ${triggers.length} total`);
+                const newTriggersToProcess = newTriggers.slice(0, maxLeads);
+                console.log(`🎯 Processing ${newTriggersToProcess.length} new triggers (sliced to match limit of ${maxLeads}) out of ${triggers.length} total`);
 
-                for (const selectedTrigger of newTriggers) {
+                for (const selectedTrigger of newTriggersToProcess) {
                     if (!selectedTrigger.company || !selectedTrigger.company.trim()) {
                         console.warn('⚠️ Skipping trigger without company name in execution loop:', selectedTrigger.headline);
                         continue;
@@ -3909,6 +4796,59 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                 console.error('❌ Weekly report digest trigger threw an error:', digestErr);
             }
 
+            // 0b. Process due mobile SAVED / RECURRING searches — a standing research subscription.
+            try {
+                const savedRes = await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/mobile_saved_searches?active=eq.true&select=*`,
+                    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                );
+                if (savedRes.ok) {
+                    const searches = await savedRes.json() as any[];
+                    const now = Date.now();
+                    const intervalMs = (f: string) => (f === 'monthly' ? 30 : 7) * 24 * 60 * 60 * 1000;
+                    const queue = env.MOBILE_QUEUE || env.STRIKE_QUEUE;
+
+                    for (const s of searches) {
+                        const lastRun = s.last_run_at ? new Date(s.last_run_at).getTime() : 0;
+                        if (lastRun && (now - lastRun) < intervalMs(s.frequency)) continue; // not due yet
+                        if (!queue) break;
+
+                        // Only run what the user can afford (per-delivery billing happens in the consumer).
+                        let available = 0;
+                        try {
+                            const balRes = await fetch(
+                                `${env.SUPABASE_URL}/rest/v1/mobile_strike_balances?user_id=eq.${s.user_id}&select=credits_purchased,credits_used`,
+                                { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                            );
+                            if (balRes.ok) {
+                                const rows = await balRes.json() as any[];
+                                if (rows[0]) available = (rows[0].credits_purchased || 0) - (rows[0].credits_used || 0);
+                            }
+                        } catch { /* treat as 0 */ }
+
+                        if (available <= 0) {
+                            console.log(`⏭️ Recurring search #${s.id}: user out of credits, skipping (will retry next cycle).`);
+                            continue;
+                        }
+
+                        const count = Math.min(s.strike_limit || 10, available);
+                        await queue.send({
+                            action: 'mobile_strike_generation',
+                            userId: s.user_id,
+                            targetAudience: s.target_audience,
+                            market: s.market,
+                            desiredOutcome: s.desired_outcome || '',
+                            informationToGather: s.information_to_gather || '',
+                            remainingCount: count,
+                        });
+                        await patchRow(env, 'mobile_saved_searches', { last_run_at: new Date(now).toISOString() }, 'id', s.id);
+                        console.log(`🔁 Recurring search #${s.id} queued (${count} strikes) for user ${s.user_id}.`);
+                    }
+                }
+            } catch (recurErr) {
+                console.error('❌ Recurring saved-search processing failed:', recurErr);
+            }
+
             // 0. Clean up stale agents (running >30 min) from previous runs.
             // A single agent dispatch enriches many triggers sequentially (Apollo + Gemini + Exa),
             // which can legitimately exceed several minutes — a 5-min reset would clear the lock
@@ -4115,7 +5055,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
             }
             // 2b. Dispatch Scheduled Funnel Sequence Steps
             const nowIso = new Date().toISOString();
-            const schedUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.scheduled&scheduled_send_at=lte.${nowIso}&select=id,workflow_id,funnel_id,strike_funnels(status)&limit=100`;
+            const schedUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.scheduled&mobile_user_id=is.null&scheduled_send_at=lte.${nowIso}&select=id,workflow_id,funnel_id,strike_funnels(status)&limit=100`;
             const schedRes = await fetch(schedUrl, { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } });
             
             if (schedRes.ok) {
@@ -4165,7 +5105,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
             // 2c. Auto-recover and dispatch Approved campaigns that are stuck
             try {
-                const appUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.approved&select=id,workflow_id,email_subject,email_subject_b,drafted_body,target_id,sender_email&limit=50`;
+                const appUrl = `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.approved&mobile_user_id=is.null&select=id,workflow_id,email_subject,email_subject_b,drafted_body,target_id,sender_email&limit=50`;
                 const appRes = await fetch(appUrl, { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } });
                 if (appRes.ok) {
                     const approvedStrikes = await appRes.json() as any[];
@@ -4244,7 +5184,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                     Prefer: 'return=representation',
                 };
                 const strandedActiveRes = await fetch(
-                    `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.active&sent_at=is.null&updated_at=lt.${encodeURIComponent(twoHoursAgo)}&or=(approved_at.not.is.null,funnel_id.not.is.null)&select=id`,
+                    `${env.SUPABASE_URL}/rest/v1/strike_campaigns?status=eq.active&mobile_user_id=is.null&sent_at=is.null&updated_at=lt.${encodeURIComponent(twoHoursAgo)}&or=(approved_at.not.is.null,funnel_id.not.is.null)&select=id`,
                     { method: 'PATCH', headers: strandedHeaders, body: JSON.stringify({ status: 'approved' }) }
                 );
                 if (strandedActiveRes.ok) {

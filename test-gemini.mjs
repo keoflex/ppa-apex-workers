@@ -4,12 +4,7 @@ dotenv.config({ path: '.dev.vars' });
 async function testGemini() {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${process.env.GEMINI_API_KEY}`;
     const payload = {
-        contents: [{ role: 'user', parts: [{ text: "Who is the CEO of Apple? and what is his email? Return strict JSON format: { guesses: [{email, rationale}]}." }] }],
-        generationConfig: {
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-        },
-        tools: [{ googleSearch: {} }]
+        contents: [{ role: 'user', parts: [{ text: "Who is the CEO of Apple?" }] }]
     };
 
     const res = await fetch(url, {
