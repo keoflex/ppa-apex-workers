@@ -34,6 +34,99 @@ import { copilotChat, type CopilotRequest } from './activities/copilot-chat';
 import { insertRow, patchRow, fetchRow } from './utils/supabase';
 import { Webhook, WebhookVerificationError } from 'standardwebhooks';
 
+/**
+ * Best-effort discovery of a REAL published contact from a company's own website.
+ * Fetches the homepage and common contact pages, then extracts mailto:/tel: and on-page
+ * email/phone matches. Returns only contacts that actually appear on the site — we never
+ * fabricate a pattern like info@domain — so a delivered contact is always verifiable.
+ * Used by the contact-critical strike gate.
+ */
+async function discoverPublicContact(domain: string): Promise<{ email: string; phone: string; source: string }> {
+    const clean = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+    if (!clean || !clean.includes('.')) return { email: '', phone: '', source: '' };
+    const candidates = [
+        `https://${clean}/contact`,
+        `https://${clean}/contact-us`,
+        `https://${clean}/about`,
+        `https://${clean}/`,
+    ];
+    const rootDomain = clean.split('.').slice(-2).join('.');
+    const skipLocal = /^(?:no-?reply|noreply|donotreply|example|email|your)/i;
+    for (const url of candidates) {
+        try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 6000);
+            const res = await fetch(url, {
+                signal: controller.signal,
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ApexResearch/1.0; +https://polsinellipa.com)' },
+                redirect: 'follow',
+            });
+            clearTimeout(timer);
+            if (!res.ok) continue;
+            const html = (await res.text()).slice(0, 500_000);
+
+            // Emails: prefer mailto:, then plain on-page text. Drop image filenames & no-reply.
+            const emails = new Set<string>();
+            for (const m of html.matchAll(/mailto:([^"'?>\s]+@[^"'?>\s]+)/gi)) emails.add(m[1].toLowerCase());
+            for (const m of html.matchAll(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g)) emails.add(m[0].toLowerCase());
+            const ranked = [...emails].filter(e => !skipLocal.test(e) && !/\.(png|jpe?g|gif|webp|svg|css|js)$/i.test(e));
+            const email = ranked.find(e => e.endsWith('@' + rootDomain) || e.includes(rootDomain)) || ranked[0] || '';
+
+            // Phone: tel: link first, then a loose North-America-friendly pattern.
+            let phone = '';
+            const tel = html.match(/tel:([+0-9().\-\s]{7,})/i);
+            if (tel) phone = tel[1].replace(/\s+/g, ' ').trim();
+            else {
+                const p = html.match(/\+?\d[\d().\-\s]{8,}\d/);
+                if (p) phone = p[0].replace(/\s+/g, ' ').trim();
+            }
+
+            if (email || phone) return { email, phone, source: url };
+        } catch (_) { /* try next candidate */ }
+    }
+    return { email: '', phone: '', source: '' };
+}
+
+/** Small stable string hash (djb2) → base36, for compact cache keys. */
+function cacheHash(input: string): string {
+    let h = 5381;
+    for (let i = 0; i < input.length; i++) h = ((h << 5) + h + input.charCodeAt(i)) >>> 0;
+    return h.toString(36);
+}
+
+/**
+ * Reads a non-expired entry from the mobile_research_cache table. Used to avoid re-paying Exa /
+ * Apollo / Gemini for research we've already done. Returns the stored payload or null.
+ */
+async function getResearchCache(env: Env, key: string): Promise<any | null> {
+    try {
+        const res = await fetch(
+            `${env.SUPABASE_URL}/rest/v1/mobile_research_cache?cache_key=eq.${encodeURIComponent(key)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=payload&limit=1`,
+            { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+        );
+        if (!res.ok) return null;
+        const rows = await res.json() as any[];
+        return rows[0]?.payload ?? null;
+    } catch { return null; }
+}
+
+/** Upserts a cache entry with a TTL (days). Requires a UNIQUE constraint on cache_key. */
+async function setResearchCache(env: Env, key: string, payload: any, ttlDays: number): Promise<void> {
+    try {
+        const expires = new Date(Date.now() + ttlDays * 86400000).toISOString();
+        await fetch(`${env.SUPABASE_URL}/rest/v1/mobile_research_cache`, {
+            method: 'POST',
+            headers: {
+                apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                'Content-Type': 'application/json',
+                Prefer: 'resolution=merge-duplicates',
+            },
+            body: JSON.stringify({ cache_key: key, payload, expires_at: expires }),
+        });
+    } catch { /* non-fatal: caching is best-effort */ }
+}
+
 export function normalizeDomain(companyName: string, enrichmentData?: any, sourceUrl?: string | null): string {
     // 1. Check if enrichment data has a domain
     let domain = enrichmentData?.company_domain || enrichmentData?.companyDomain || enrichmentData?.domain;
@@ -1861,6 +1954,8 @@ Return ONLY a JSON object:
                     market: string;
                     desiredOutcome: string;
                     informationToGather?: string;
+                    sector?: string;
+                    contactRequired?: boolean;
                     remainingCount: number;
                     watchlistDomain?: string;
                     watchlistTrigger?: any;
@@ -1879,6 +1974,8 @@ Return ONLY a JSON object:
                         market: body.market,
                         desiredOutcome: body.desiredOutcome,
                         informationToGather: body.informationToGather || '',
+                        sector: body.sector || '',
+                        contactRequired: !!body.contactRequired,
                         remainingCount: body.remainingCount || 1,
                         watchlistDomain: body.watchlistDomain || null,
                         watchlistTrigger: body.watchlistTrigger || null,
@@ -2874,7 +2971,7 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
 
                 // ── Handle mobile_strike_generation ──
                 if (msg.body?.action === 'mobile_strike_generation') {
-                    const { userId, targetAudience, market, desiredOutcome, informationToGather, remainingCount, watchlistDomain, watchlistTrigger } = msg.body;
+                    const { userId, targetAudience, market, desiredOutcome, informationToGather, sector, contactRequired, remainingCount, watchlistDomain, watchlistTrigger } = msg.body;
                     console.log(`📱 Priority Mobile Strike Generation: User #${userId} | Audience: ${targetAudience} | Market: ${market} | Limit: ${remainingCount}`);
 
                     try {
@@ -2922,6 +3019,16 @@ Return ONLY valid JSON: {"subject": "...", "body": "..."}`;
                                 dataSource: watchlistTrigger.source || 'Watchlist Monitor'
                             });
                         } else {
+                            // ── Exa discovery cache (cost saver) ──
+                            // The candidate company list for a given request is user-independent, so we
+                            // cache it for 14 days. Identical or recurring searches reuse it and skip BOTH
+                            // the Exa search calls AND the Gemini query-gen/discovery calls entirely.
+                            const discKey = 'disc:' + cacheHash([targetAudience, market, sector || '', desiredOutcome, informationToGather || ''].join('|').toLowerCase().trim());
+                            const cachedDisc = await getResearchCache(env, discKey);
+                            if (Array.isArray(cachedDisc) && cachedDisc.length > 0) {
+                                uniqueResults.push(...cachedDisc);
+                                console.log(`♻️ Exa discovery cache HIT for "${targetAudience} · ${market}" (${cachedDisc.length} candidates) — skipped Exa + Gemini discovery (no API spend).`);
+                            } else {
                             // 2. Generate search queries optimized for Exa
                             const queryGenSystem = `You are a search query engineering expert. Given a target audience and a geographic market, generate 2 optimized search queries for Exa.ai (neural search engine) to find target companies and their websites.
 Keep them simple, using natural language or neural-search friendly phrases.
@@ -2949,7 +3056,7 @@ Return EXACTLY a JSON object with a "queries" array:
                                 });
                                 if (geminiRes.ok) {
                                     const parsed = await safeGeminiResponseParse(geminiRes);
-                                    const parsedJson = JSON.parse(parsed.text || '{}');
+                                    const parsedJson = safeJsonParse<any>(parsed.text, {});
                                     if (Array.isArray(parsedJson.queries) && parsedJson.queries.length > 0) {
                                         queries = parsedJson.queries;
                                     }
@@ -2965,8 +3072,11 @@ Return EXACTLY a JSON object with a "queries" array:
                             const freeTriggers: any[] = [];
 
                             // Over-fetch candidates so that after dedup + enrichment failures we still
-                            // have enough fresh targets to fill the requested count.
-                            const exaPerQuery = Math.max(remainingCount * 3, 30);
+                            // have enough fresh targets to fill the requested count — but cap it tightly,
+                            // since Exa bills per page of text returned. 2× the order with a 15–50 band
+                            // (was 3×, min 30, uncapped) meaningfully cuts Exa spend; Gemini discovery and
+                            // the free gov sensors also contribute candidates to fill the order.
+                            const exaPerQuery = Math.min(Math.max(remainingCount * 2, 15), 50);
                             console.log(`🔑 EXA_API_KEY ${env.EXA_API_KEY ? 'present' : 'MISSING — Exa will return nothing'}; requesting ${exaPerQuery} results/query for ${remainingCount} target(s)`);
 
                             for (const query of queries) {
@@ -3033,7 +3143,7 @@ Return EXACTLY a JSON object with a "queries" array:
                                 const discSystem = `You are a B2B prospecting engine. Given a target audience and a market/geography, list REAL, currently-operating companies that genuinely match. Return ONLY a JSON object: {"companies":[{"name":"Company Name","domain":"company.com","reason":"one short reason they fit"}]}. Use real companies and their real primary website domain. Do NOT return SEC filing entities, investment funds, or SPACs unless the audience explicitly asks for them.`;
                                 // Cap the count so the JSON response can't truncate; over-fill modestly.
                                 const discCount = Math.min(Math.max(remainingCount + 5, 12), 25);
-                                const discPrompt = `Target audience: ${targetAudience}\nMarket / geography: ${market}\nDesired outcome: ${desiredOutcome}\nInformation focus: ${informationToGather || 'general fit'}\n${profile.ideal_customer_profile ? `Ideal customer profile: ${profile.ideal_customer_profile}\n` : ''}${profile.exclusions ? `AVOID: ${profile.exclusions}\n` : ''}${learningHint ? learningHint + '\n' : ''}Return up to ${discCount} companies.`;
+                                const discPrompt = `Target audience: ${targetAudience}\nMarket / geography: ${market}\n${sector ? `Industry sector (companies MUST operate in this sector): ${sector}\n` : ''}Desired outcome: ${desiredOutcome}\nInformation focus: ${informationToGather || 'general fit'}\n${profile.ideal_customer_profile ? `Ideal customer profile: ${profile.ideal_customer_profile}\n` : ''}${profile.exclusions ? `AVOID: ${profile.exclusions}\n` : ''}${learningHint ? learningHint + '\n' : ''}Return up to ${discCount} companies.`;
                                 const discRes = await fetchGemini(env, 'lite', {
                                     activityName: 'mobile-company-discovery',
                                     method: 'POST',
@@ -3146,6 +3256,14 @@ Return EXACTLY a JSON object with a "queries" array:
                                     }
                                 } catch (_) {}
                             }
+
+                            // Cache the merged candidate list (user-independent) so repeat/similar
+                            // searches reuse it for 14 days instead of re-paying Exa + Gemini.
+                            if (uniqueResults.length > 0) {
+                                await setResearchCache(env, discKey, uniqueResults, 14);
+                                console.log(`💾 Cached ${uniqueResults.length} discovery candidates for 14 days (key ${discKey}).`);
+                            }
+                            } // end discovery cache-miss branch
                         }
 
                         console.log(`🧹 Unified search found ${uniqueResults.length} unique domains (Exa → Gemini discovery → Free Government/State Sensors, in priority order).`);
@@ -3163,28 +3281,51 @@ Return EXACTLY a JSON object with a "queries" array:
                         console.log(`🆕 ${freshResults.length} targets are fresh for User #${userId}`);
 
                         // 5. Generate strikes up to remainingCount.
-                        // billableCount only counts HIGH-CONFIDENCE (audience-matched) sources — Exa and
-                        // Gemini discovery. Low-confidence free-register fills are delivered as a bonus
-                        // but NOT charged, so the user is never billed for off-audience results.
+                        // Every DELIVERED strike is billed (1 credit). For normal searches we only
+                        // deliver HIGH-CONFIDENCE (audience-matched: Exa / Gemini) results — no free
+                        // off-audience filler. Watchlist alerts are a single targeted hit and are billed too.
+                        const isWatchlist = !!watchlistDomain;
                         let generatedCount = 0;
-                        let billableCount = 0;
                         for (const target of freshResults) {
                             if (generatedCount >= remainingCount) break;
 
                             const isHighConfidence = target.dataSource === 'Exa.ai Mobile Search'
                                 || target.dataSource === 'Gemini Discovery';
 
+                            // Skip low-confidence filler for normal searches BEFORE spending any money
+                            // on enrichment/synthesis. (Watchlist hits always proceed.)
+                            if (!isWatchlist && !isHighConfidence) continue;
+
                             const companyDomain = target.companyDomain;
                             const companyCleanName = target.companyName;
 
                             console.log(`⚡ Processing fresh target company: ${companyCleanName} (${companyDomain})`);
 
-                            // Check if company exists in lead_targets already
-                            const existingLeadRes = await fetch(
-                                `${env.SUPABASE_URL}/rest/v1/lead_targets?company=ilike.${encodeURIComponent(companyCleanName)}&select=id,executive_name,executive_title,enrichment_data`,
-                                { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
-                            );
-                            const existingLeads = existingLeadRes.ok ? await existingLeadRes.json() as any[] : [];
+                            // Check if company exists in lead_targets already so we can REUSE its
+                            // enrichment (Apollo contact, revenue, signals) and skip the paid enrichLead()
+                            // call. We match by DOMAIN first (reliable across name variants like
+                            // "Acme" / "Acme Corp" / "Acme, Inc."), then fall back to an exact name match.
+                            const leadSelect = 'select=id,executive_name,executive_title,enrichment_data&limit=1';
+                            const leadHeaders = { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } };
+                            let existingLeads: any[] = [];
+                            if (companyDomain) {
+                                const encDomain = encodeURIComponent(companyDomain);
+                                const byDomainRes = await fetch(
+                                    `${env.SUPABASE_URL}/rest/v1/lead_targets?or=(enrichment_data->>company_domain.eq.${encDomain},enrichment_data->>companyDomain.eq.${encDomain})&${leadSelect}`,
+                                    leadHeaders
+                                );
+                                if (byDomainRes.ok) existingLeads = await byDomainRes.json() as any[];
+                            }
+                            if (existingLeads.length === 0) {
+                                const byNameRes = await fetch(
+                                    `${env.SUPABASE_URL}/rest/v1/lead_targets?company=ilike.${encodeURIComponent(companyCleanName)}&${leadSelect}`,
+                                    leadHeaders
+                                );
+                                if (byNameRes.ok) existingLeads = await byNameRes.json() as any[];
+                            }
+                            if (existingLeads.length > 0) {
+                                console.log(`♻️ Reusing cached enrichment for ${companyCleanName} (${companyDomain}) — skipped Apollo/enrich spend.`);
+                            }
                             
                             let leadId: number | null = null;
                             let enrichedLead: any = null;
@@ -3240,6 +3381,38 @@ Return EXACTLY a JSON object with a "queries" array:
                                 || normalizeDomain(companyCleanName, null)
                             );
 
+                            // Contact-critical (#1): when the user flags contact info as required and
+                            // enrichment didn't surface an email/phone, try to discover a REAL published
+                            // contact from the company's own website before deciding. We extract only
+                            // addresses that actually appear on the site — never a fabricated pattern —
+                            // so a delivered contact is always verifiable.
+                            let hasRealContact = !!(enrichedLead.email || enrichedLead.phone);
+                            if (contactRequired && !hasRealContact && resolvedDomain) {
+                                try {
+                                    const discovered = await discoverPublicContact(resolvedDomain);
+                                    if (discovered.email) {
+                                        enrichedLead.email = discovered.email;
+                                        enrichedLead.emailConfidence = 'website';
+                                        enrichedLead.emailSource = discovered.source;
+                                        hasRealContact = true;
+                                    } else if (discovered.phone) {
+                                        enrichedLead.phone = discovered.phone;
+                                        hasRealContact = true;
+                                    }
+                                    if (hasRealContact) console.log(`🔎 Discovered website contact for ${companyCleanName}: ${enrichedLead.email || enrichedLead.phone}`);
+                                } catch (e) {
+                                    console.warn(`⚠️ Contact discovery failed for ${resolvedDomain}:`, e);
+                                }
+                            }
+
+                            // Hard gate: never deliver (or bill for) a contactless strike when the user
+                            // marked contact info critical. Skipping here means no synthesis, no draft,
+                            // no insert, and no credit charged for this company.
+                            if (contactRequired && !hasRealContact) {
+                                console.log(`⏭️ Skipping ${companyCleanName} — no verified contact and contactRequired=true (not billed).`);
+                                continue;
+                            }
+
                             // Save to lead_targets if it's new
                             if (!leadId) {
                                 const targetRes = await insertRow(env, 'lead_targets', {
@@ -3289,22 +3462,37 @@ Return EXACTLY a JSON object with a "queries" array:
                                 enrichedLead.executiveResearch ? `Exec background: ${enrichedLead.executiveResearch}` : '',
                             ].filter(Boolean).join(' | ');
 
-                            const research = await synthesizeMobileResearch(env, {
-                                company: companyCleanName,
-                                industry: (enrichedLead as any).industry,
-                                trigger: target.triggerEvent || '',
-                                enrichmentContext,
-                                primaryContactName: enrichedLead.executiveName,
-                                primaryContactTitle: enrichedLead.executiveTitle,
-                                senderCompany: companyName,
-                                senderNarrative: servicesNarrative || '',
-                                targetAudience,
-                                market,
-                                desiredOutcome,
-                                informationToGather: informationToGather || '',
-                                idealCustomerProfile: profile.ideal_customer_profile || '',
-                                exclusions: profile.exclusions || '',
-                            });
+                            // Synthesis cache (cost saver): the findings are tailored to THIS user's
+                            // request, so we key by user + company domain + a hash of the request inputs.
+                            // An exact repeat (e.g. a recurring saved search hitting the same company with
+                            // no new angle) reuses the result instead of re-paying Gemini. Different
+                            // requests still synthesize fresh, so quality is unaffected.
+                            const synKey = 'syn:' + userId + ':' + resolvedDomain + ':' + cacheHash([
+                                informationToGather || '', desiredOutcome, targetAudience,
+                                profile.ideal_customer_profile || '', profile.exclusions || '',
+                            ].join('|').toLowerCase().trim());
+                            let research = await getResearchCache(env, synKey);
+                            if (research) {
+                                console.log(`♻️ Synthesis cache HIT for ${companyCleanName} — skipped Gemini synthesis.`);
+                            } else {
+                                research = await synthesizeMobileResearch(env, {
+                                    company: companyCleanName,
+                                    industry: (enrichedLead as any).industry,
+                                    trigger: target.triggerEvent || '',
+                                    enrichmentContext,
+                                    primaryContactName: enrichedLead.executiveName,
+                                    primaryContactTitle: enrichedLead.executiveTitle,
+                                    senderCompany: companyName,
+                                    senderNarrative: servicesNarrative || '',
+                                    targetAudience,
+                                    market,
+                                    desiredOutcome,
+                                    informationToGather: informationToGather || '',
+                                    idealCustomerProfile: profile.ideal_customer_profile || '',
+                                    exclusions: profile.exclusions || '',
+                                });
+                                await setResearchCache(env, synKey, research, 14);
+                            }
 
                             // Build the contact list: the Apollo-enriched primary (verified) plus the
                             // additional decision-makers from synthesis (suggested, not verified).
@@ -3317,7 +3505,7 @@ Return EXACTLY a JSON object with a "queries" array:
                                     linkedin: enrichedLead.linkedinUrl || '',
                                     verified: !!enrichedLead.email,
                                 },
-                                ...research.additionalContacts.map(c => ({
+                                ...(research.additionalContacts || []).map((c: { name: string; title: string }) => ({
                                     name: c.name, title: c.title, email: '', phone: '', linkedin: '', verified: false,
                                 })),
                             ];
@@ -3372,8 +3560,7 @@ Return EXACTLY a JSON object with a "queries" array:
                             });
 
                             generatedCount++;
-                            if (isHighConfidence) billableCount++;
-                            console.log(`✅ Priority strike generated for ${companyCleanName} (${companyDomain}) [${isHighConfidence ? 'billable' : 'bonus/unbilled'}] → User #${userId}`);
+                            console.log(`✅ Priority strike generated for ${companyCleanName} (${companyDomain})${isWatchlist ? ' [watchlist]' : ''} → User #${userId}`);
 
                             // Dispatch push notification if APNS device token is configured
                             if (profile.apns_device_token) {
@@ -3395,15 +3582,140 @@ Return EXACTLY a JSON object with a "queries" array:
                             }
                         }
 
-                        // Charge ONLY for high-confidence (audience-matched) deliveries — never for
-                        // low-confidence free-register bonus fills. Dispatch deducts nothing up front.
-                        if (billableCount > 0) {
+                        // ── Partner Network injection (#2) ──
+                        // If any strategic partners genuinely align with this research request, surface
+                        // them as highlighted "Strategic Partner" strikes with their real contact info.
+                        // These are a FREE value-add (not billed) and skipped for watchlist alerts.
+                        // Flip PARTNER_STRIKES_BILLED to charge a credit for them instead.
+                        const PARTNER_STRIKES_BILLED = false;
+                        if (!isWatchlist) {
+                            try {
+                                const partnersRes = await fetch(
+                                    `${env.SUPABASE_URL}/rest/v1/partner_profiles?select=id,name,website,value_proposition,key_offerings,categories,ideal_customer_profile,ai_alignment_rules,contact_name,contact_email,contact_phone`,
+                                    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                                );
+                                const partners = partnersRes.ok ? await partnersRes.json() as any[] : [];
+                                if (partners.length > 0) {
+                                    const partnerList = partners.map(p =>
+                                        `#${p.id} ${p.name} — categories: ${(p.categories || []).join(', ') || 'n/a'}; offerings: ${(p.key_offerings || []).join(', ') || 'n/a'}; ICP: ${p.ideal_customer_profile || 'n/a'}; rules: ${p.ai_alignment_rules || 'n/a'}`
+                                    ).join('\n');
+                                    const matchPrompt = `A client made this research request:\nAudience: ${targetAudience}\nMarket: ${market}\n${sector ? `Sector: ${sector}\n` : ''}Desired outcome: ${desiredOutcome}\nInfo needed: ${informationToGather || 'general fit'}\n\nOur strategic partners:\n${partnerList}\n\nReturn ONLY partners that GENUINELY align with this request (respect each partner's alignment rules). Give a one-sentence reason tailored to the request. Return at most 2. If none truly fit, return an empty array.`;
+                                    const matchRes = await fetchGemini(env, 'lite', {
+                                        activityName: 'mobile-partner-match',
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            contents: [{ role: 'user', parts: [{ text: matchPrompt }] }],
+                                            generationConfig: {
+                                                temperature: 0.3, maxOutputTokens: 1024, responseMimeType: 'application/json',
+                                                responseSchema: { type: 'OBJECT', properties: { matches: { type: 'ARRAY', items: { type: 'OBJECT', properties: { id: { type: 'NUMBER' }, reason: { type: 'STRING' } }, required: ['id', 'reason'] } } }, required: ['matches'] },
+                                            },
+                                        }),
+                                    });
+                                    let matches: any[] = [];
+                                    if (matchRes.ok) {
+                                        const { text: mText } = await safeGeminiResponseParse(matchRes);
+                                        matches = safeJsonParse<{ matches?: any[] }>(mText || '', { matches: [] }).matches || [];
+                                    }
+                                    for (const m of matches.slice(0, 2)) {
+                                        const partner = partners.find(p => p.id === m.id);
+                                        if (!partner) continue;
+                                        // Dedup: don't re-deliver the same partner to the same user.
+                                        const dupRes = await fetch(
+                                            `${env.SUPABASE_URL}/rest/v1/strike_campaigns?select=id&mobile_user_id=eq.${userId}&mobile_partner_id=eq.${partner.id}&limit=1`,
+                                            { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                                        );
+                                        const dup = dupRes.ok ? await dupRes.json() as any[] : [];
+                                        if (dup.length > 0) continue;
+
+                                        const partnerContacts = [{
+                                            name: partner.contact_name || partner.name,
+                                            title: 'Strategic Partner',
+                                            email: partner.contact_email || '',
+                                            phone: partner.contact_phone || '',
+                                            linkedin: '',
+                                            verified: !!partner.contact_email,
+                                        }];
+
+                                        // Resolve (reuse-or-create) a lead_target for the partner so the strike
+                                        // joins cleanly in the results endpoint and shows the partner's name.
+                                        const partnerDomain = (partner.website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '');
+                                        let partnerLeadId: number | null = null;
+                                        const existingPartnerLeadRes = await fetch(
+                                            `${env.SUPABASE_URL}/rest/v1/lead_targets?company=ilike.${encodeURIComponent(partner.name)}&select=id&limit=1`,
+                                            { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+                                        );
+                                        const existingPartnerLead = existingPartnerLeadRes.ok ? await existingPartnerLeadRes.json() as any[] : [];
+                                        if (existingPartnerLead.length > 0) {
+                                            partnerLeadId = existingPartnerLead[0].id;
+                                        } else {
+                                            const pLeadRes = await insertRow(env, 'lead_targets', {
+                                                company: partner.name,
+                                                executive_name: partner.contact_name || 'Partner Contact',
+                                                executive_title: 'Strategic Partner',
+                                                trigger_event: m.reason || partner.value_proposition || 'Strategic partner in our network.',
+                                                trigger_source: partner.website || null,
+                                                trigger_relevance: 95,
+                                                enrichment_data: {
+                                                    data_source: 'Partner Network',
+                                                    company_domain: partnerDomain,
+                                                    companyDomain: partnerDomain,
+                                                    email: partner.contact_email || '',
+                                                    phone: partner.contact_phone || '',
+                                                    is_partner: true,
+                                                    source: 'partner_profiles',
+                                                },
+                                            });
+                                            partnerLeadId = (pLeadRes.ok && pLeadRes.data?.[0]) ? pLeadRes.data[0].id : null;
+                                        }
+                                        const pDraft = await generateMobileDraft(env, {
+                                            lead: { company: partner.name, executiveName: partner.contact_name || 'Unknown', executiveTitle: 'Strategic Partner' } as any,
+                                            senderName: profile.full_name || '',
+                                            senderCompany: companyName,
+                                            senderNarrative: servicesNarrative || '',
+                                            desiredOutcome,
+                                            targetCompany: partner.name,
+                                            triggerContext: m.reason || partner.value_proposition || '',
+                                        });
+                                        const pWorkflowId = `wf-prt-${crypto.randomUUID().slice(0, 12)}`;
+                                        const pRes = await insertRow(env, 'strike_campaigns', {
+                                            target_id: partnerLeadId,
+                                            status: 'pending_hitl',
+                                            persona_used: profile.full_name || companyName,
+                                            email_subject: pDraft.subject,
+                                            drafted_body: pDraft.body,
+                                            workflow_id: pWorkflowId,
+                                            campaign_id: null,
+                                            mobile_user_id: userId,
+                                            mobile_delivered_at: new Date().toISOString(),
+                                            mobile_search_label: [targetAudience, market].filter(Boolean).join(' · '),
+                                            mobile_relevance_score: 95,
+                                            mobile_relevance_reason: m.reason || 'Strategic partner aligned with your request.',
+                                            mobile_research_findings: JSON.stringify([partner.value_proposition || m.reason || 'Strategic partner in our network.'].filter(Boolean)),
+                                            mobile_contacts: JSON.stringify(partnerContacts),
+                                            mobile_is_partner: true,
+                                            mobile_partner_id: partner.id,
+                                        });
+                                        if (pRes.ok) {
+                                            if (PARTNER_STRIKES_BILLED) generatedCount++;
+                                            console.log(`🤝 Injected partner strike: ${partner.name} → User #${userId}`);
+                                        }
+                                    }
+                                }
+                            } catch (partnerErr) {
+                                console.warn('⚠️ Partner injection failed:', partnerErr);
+                            }
+                        }
+
+                        // Charge 1 credit per DELIVERED strike (only on-audience strikes are delivered now,
+                        // and watchlist alerts are billed too). Dispatch deducts nothing up front.
+                        if (generatedCount > 0) {
                             try {
                                 const balRows = await fetchRow(env, 'mobile_strike_balances', 'user_id', userId);
                                 const current = balRows && balRows[0] ? balRows[0] : null;
                                 if (current) {
                                     await patchRow(env, 'mobile_strike_balances', {
-                                        credits_used: (current.credits_used || 0) + billableCount,
+                                        credits_used: (current.credits_used || 0) + generatedCount,
                                         updated_at: new Date().toISOString(),
                                     }, 'user_id', userId);
                                 }
@@ -3412,10 +3724,9 @@ Return EXACTLY a JSON object with a "queries" array:
                             }
                         }
 
-                        // Log a MISSED opportunity when no on-audience (high-confidence) targets were
-                        // found, so the team can source options from the web dashboard later. Captures
-                        // exactly what the user asked for. (Best-effort — table may not exist yet.)
-                        if (billableCount === 0) {
+                        // Log a MISSED opportunity when nothing on-audience was found (skip for watchlist
+                        // alerts), so the team can source options from the web dashboard later.
+                        if (generatedCount === 0 && !isWatchlist) {
                             try {
                                 await insertRow(env, 'mobile_missed_strikes', {
                                     user_id: userId,
@@ -3424,7 +3735,7 @@ Return EXACTLY a JSON object with a "queries" array:
                                     desired_outcome: desiredOutcome,
                                     information_requested: informationToGather || null,
                                     requested_count: remainingCount,
-                                    candidates_found: generatedCount, // low-confidence bonus fills, if any
+                                    candidates_found: 0,
                                     created_at: new Date().toISOString(),
                                 });
                                 console.log(`📝 Logged missed strike request for User #${userId} (audience="${targetAudience}", market="${market}").`);
@@ -3433,7 +3744,7 @@ Return EXACTLY a JSON object with a "queries" array:
                             }
                         }
 
-                        console.log(`📱 Priority Mobile Strike Generation complete: ${generatedCount}/${remainingCount} delivered, ${billableCount} billed (${generatedCount - billableCount} unbilled bonus).`);
+                        console.log(`📱 Priority Mobile Strike Generation complete: ${generatedCount}/${remainingCount} delivered & billed.`);
                         msg.ack();
                     } catch (queueErr) {
                         console.error('❌ Priority Mobile Strike Generation queue failed:', queueErr);
@@ -3560,7 +3871,7 @@ Return EXACTLY a JSON object with a "queries" array:
                         // ── Check Watchlist Monitored Domains ──
                         try {
                             const monitoredRes = await fetch(
-                                `${env.SUPABASE_URL}/rest/v1/mobile_monitored_domains?select=user_id,domain`,
+                                `${env.SUPABASE_URL}/rest/v1/mobile_monitored_domains?select=user_id,domain&limit=10000`,
                                 { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
                             );
                             if (monitoredRes.ok) {
@@ -3580,41 +3891,55 @@ Return EXACTLY a JSON object with a "queries" array:
                                         }
                                     }
 
-                                    // Check triggers
+                                    // Check triggers — BATCHED per matched domain so this scales to
+                                    // thousands of watchers (2 queries per matched domain, not per user).
                                     let watchlistMatches = 0;
+                                    const hdr = { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` };
+                                    const handledDomains = new Set<string>();
                                     for (const trigger of dedupedTriggers) {
-                                        // Infer domain
-                                        let domain = normalizeDomain(trigger.company || '', null, trigger.sourceUrl);
-
+                                        const domain = normalizeDomain(trigger.company || '', null, trigger.sourceUrl);
                                         const matchingUserIds = domainUserMap.get(domain);
-                                        if (matchingUserIds) {
-                                            for (const userId of matchingUserIds) {
-                                                // Check if already delivered to this user
-                                                const checkDelivered = await fetch(
-                                                    `${env.SUPABASE_URL}/rest/v1/mobile_delivered_strikes_log?user_id=eq.${userId}&company_domain=eq.${domain}&select=id`,
-                                                    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
-                                                );
-                                                const delivered = checkDelivered.ok ? await checkDelivered.json() as any[] : [];
-                                                if (delivered.length === 0) {
-                                                    console.log(`🎯 WATCHLIST MATCH: Trigger for "${domain}" matches User #${userId}! Queueing priority strike...`);
-                                                    if (env.MOBILE_QUEUE) {
-                                                        await env.MOBILE_QUEUE.send({
-                                                            userId,
-                                                            targetAudience: 'Watchlist Alert',
-                                                            market: 'Global',
-                                                            desiredOutcome: 'Alert',
-                                                            informationToGather: 'Watchlist Signal',
-                                                            remainingCount: 1,
-                                                            watchlistDomain: domain,
-                                                            watchlistTrigger: trigger
-                                                        });
-                                                        watchlistMatches++;
-                                                    }
-                                                }
-                                            }
+                                        if (!matchingUserIds || matchingUserIds.size === 0) continue;
+                                        if (handledDomains.has(domain)) continue; // one alert per domain per sweep
+                                        handledDomains.add(domain);
+                                        const candidates = [...matchingUserIds];
+
+                                        // Batch 1: which of these users already received this domain?
+                                        const delRes = await fetch(
+                                            `${env.SUPABASE_URL}/rest/v1/mobile_delivered_strikes_log?company_domain=eq.${encodeURIComponent(domain)}&select=user_id&limit=10000`,
+                                            { headers: hdr }
+                                        );
+                                        const deliveredSet = new Set((delRes.ok ? await delRes.json() as any[] : []).map(r => r.user_id));
+                                        const fresh = candidates.filter(uid => !deliveredSet.has(uid));
+                                        if (fresh.length === 0) continue;
+
+                                        // Batch 2: which fresh users have at least 1 credit (alerts cost 1 credit)?
+                                        const balRes = await fetch(
+                                            `${env.SUPABASE_URL}/rest/v1/mobile_strike_balances?user_id=in.(${fresh.join(',')})&select=user_id,credits_purchased,credits_used`,
+                                            { headers: hdr }
+                                        );
+                                        const balRows = balRes.ok ? await balRes.json() as any[] : [];
+                                        const payable = new Set(
+                                            balRows.filter(b => (b.credits_purchased || 0) - (b.credits_used || 0) >= 1).map(b => b.user_id)
+                                        );
+
+                                        for (const userId of fresh) {
+                                            if (!payable.has(userId) || !env.MOBILE_QUEUE) continue;
+                                            await env.MOBILE_QUEUE.send({
+                                                userId,
+                                                targetAudience: 'Watchlist Alert',
+                                                market: 'Global',
+                                                desiredOutcome: 'Alert',
+                                                informationToGather: 'Watchlist Signal',
+                                                remainingCount: 1,
+                                                watchlistDomain: domain,
+                                                watchlistTrigger: trigger,
+                                            });
+                                            watchlistMatches++;
                                         }
+                                        console.log(`🎯 Watchlist "${domain}": ${fresh.length} fresh, ${payable.size} payable → queued.`);
                                     }
-                                    console.log(`👁️ Watchlist sweep complete. Queued ${watchlistMatches} priority alert generation messages.`);
+                                    console.log(`👁️ Watchlist sweep complete. Queued ${watchlistMatches} alert(s).`);
                                 }
                             }
                         } catch (watchlistErr) {
@@ -5212,6 +5537,9 @@ Return EXACTLY a JSON object with a "queries" array:
             // 5. Archive and purge old error logs to R2
             ctx.waitUntil(archiveOldErrorLogs(env));
 
+            // 6. Purge expired research-cache entries (Exa/Apollo/Gemini reuse cache)
+            ctx.waitUntil(purgeExpiredResearchCache(env));
+
             console.log(`✅ Cron complete: ${agentsDispatched} agents dispatched + additional sources + missions launched`);
         } catch (error) {
             console.error('❌ Cron error:', error);
@@ -5396,6 +5724,28 @@ async function safeQueueSendBatch(queue: Queue<any>, messages: any[]): Promise<v
  * Exports gemini_error_logs older than 5 days as a JSONL file to Cloudflare R2
  * and then deletes them from PostgreSQL to preserve audit trails while saving DB space.
  */
+/** Deletes expired entries from the research reuse cache so the table stays small. Non-fatal. */
+async function purgeExpiredResearchCache(env: Env): Promise<void> {
+    try {
+        const res = await fetch(
+            `${env.SUPABASE_URL}/rest/v1/mobile_research_cache?expires_at=lt.${encodeURIComponent(new Date().toISOString())}`,
+            {
+                method: 'DELETE',
+                headers: {
+                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    Prefer: 'count=exact',
+                },
+            }
+        );
+        if (res.ok) {
+            console.log(`🧽 Purged expired research-cache rows (${res.headers.get('content-range') || 'ok'}).`);
+        }
+    } catch (err) {
+        console.warn('⚠️ Research-cache purge failed (non-fatal):', err);
+    }
+}
+
 async function archiveOldErrorLogs(env: Env): Promise<void> {
     try {
         if (!env.CRM_ATTACHMENTS) return; // R2 binding required
