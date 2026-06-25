@@ -152,7 +152,13 @@ function repairTruncatedObject(str: string): any {
 
     // Pre-clean trailing partial properties or colons, e.g., `, "score":` or `, "score"`
     cleaned = cleaned.replace(/,\s*["'][^"']*["']?\s*:\s*$/, '');
+    cleaned = cleaned.replace(/{\s*["'][^"']*["']?\s*:\s*$/, '{');
     cleaned = cleaned.replace(/,\s*["'][^"']*$/, '');
+    cleaned = cleaned.replace(/{\s*["'][^"']*$/, '{');
+    
+    // Clean trailing partial/truncated literals like true, false, null by replacing with null
+    cleaned = cleaned.replace(/:\s*(?:t|tr|tru|f|fa|fal|fals|n|nu|nul|null)\s*$/, ': null');
+    
     cleaned = cleaned.replace(/,\s*$/, '');
 
     const stack: string[] = [];

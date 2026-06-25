@@ -70,6 +70,24 @@ function runTests() {
         assert('Extremely Malformed Array Extraction', false, e.message);
     }
 
+    // Test 7: Single Property Dangling Key without Comma
+    try {
+        const input = '{"company":';
+        const parsed = safeJsonParse<any>(input, {});
+        assert('Single Property Dangling Key', typeof parsed === 'object' && Object.keys(parsed).length === 0);
+    } catch (e: any) {
+        assert('Single Property Dangling Key', false, e.message);
+    }
+
+    // Test 8: Trailing Partial Literal
+    try {
+        const input = '{"company": "Acme", "is_active": tr';
+        const parsed = safeJsonParse<any>(input, {});
+        assert('Trailing Partial Literal', parsed.company === 'Acme' && parsed.is_active === null);
+    } catch (e: any) {
+        assert('Trailing Partial Literal', false, e.message);
+    }
+
     console.log(`\n📊 Test Summary: ${passed} passed, ${failed} failed`);
     if (failed > 0) {
         process.exit(1);
