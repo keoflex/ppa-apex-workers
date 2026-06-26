@@ -99,14 +99,14 @@ export async function fetchGemini(
         if (isRetryable) {
             const isOverload = errorMessage.includes('503') || errorMessage.includes('429');
             const isLocationError = errorMessage.includes('User Location Not Supported');
-            const currentMaxRetries = maxRetries; // Use standard retries (e.g., 3) to prevent worker timeouts
+            const currentMaxRetries = isOverload ? maxRetries + 2 : maxRetries;
 
-            // If we have retries left on the current model, do standard exponential backoff and retry (skip if location block)
+            // If we have retries left on the current model, do standard/expanded exponential backoff and retry (skip if location block)
             if (!isLocationError && attempt <= currentMaxRetries) {
-                const backoffMultiplier = 2.0; // Standard exponential backoff multiplier
+                const backoffMultiplier = isOverload ? 2.5 : 2.0;
                 const baseDelay = Math.pow(backoffMultiplier, attempt) * 1000;
-                const jitter = Math.random() * 1000; // 1s jitter to avoid thundering herd
-                const maxDelay = 10000; // Limit max delay to 10s to stay within Cloudflare execution limits
+                const jitter = Math.random() * 1500; // expanded jitter for overloads
+                const maxDelay = isOverload ? 30000 : 10000; // limit max delay to 30s for overloads to absorb congestion
                 const delayMs = Math.min(maxDelay, baseDelay + jitter);
                 
                 console.warn(`⚠️ Gemini ${currentModel} encountered error: ${errorMessage}. Retrying in ${(delayMs / 1000).toFixed(1)}s (attempt ${attempt}/${currentMaxRetries})...`);
