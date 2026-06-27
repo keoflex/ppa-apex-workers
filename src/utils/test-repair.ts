@@ -88,6 +88,24 @@ function runTests() {
         assert('Trailing Partial Literal', false, e.message);
     }
 
+    // Test 9: Trailing Partial Decimal
+    try {
+        const input = '{"company": "Acme", "score": 98.';
+        const parsed = safeJsonParse<any>(input, {});
+        assert('Trailing Partial Decimal', parsed.company === 'Acme' && parsed.score === 98);
+    } catch (e: any) {
+        assert('Trailing Partial Decimal', false, e.message);
+    }
+
+    // Test 10: Trailing Partial Exponent
+    try {
+        const input = '{"company": "Acme", "score": 1.25e+';
+        const parsed = safeJsonParse<any>(input, {});
+        assert('Trailing Partial Exponent', parsed.company === 'Acme' && parsed.score === 1.25);
+    } catch (e: any) {
+        assert('Trailing Partial Exponent', false, e.message);
+    }
+
     console.log(`\n📊 Test Summary: ${passed} passed, ${failed} failed`);
     if (failed > 0) {
         process.exit(1);

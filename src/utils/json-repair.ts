@@ -159,6 +159,12 @@ function repairTruncatedObject(str: string): any {
     // Clean trailing partial/truncated literals like true, false, null by replacing with null
     cleaned = cleaned.replace(/:\s*(?:t|tr|tru|f|fa|fal|fals|n|nu|nul|null)\s*$/, ': null');
     
+    // Clean trailing partial/truncated numeric endings (e.g., "12." -> "12" or "12.3e" -> "12.3")
+    cleaned = cleaned.replace(/:\s*(\d+)\.\s*$/, ': $1');
+    cleaned = cleaned.replace(/:\s*(\d+(?:\.\d+)?)e[+-]?\s*$/, ': $1');
+    cleaned = cleaned.replace(/(\d+)\.\s*$/, '$1');
+    cleaned = cleaned.replace(/(\d+(?:\.\d+)?)e[+-]?\s*$/, '$1');
+    
     cleaned = cleaned.replace(/,\s*$/, '');
 
     const stack: string[] = [];
